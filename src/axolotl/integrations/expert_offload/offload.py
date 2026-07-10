@@ -105,6 +105,18 @@ def _placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return ph
 
 
+def _copy_required_for(provider, block_idx: int) -> bool:
+    """Whether a non-CUDA staging copy must be made out of ``provider``'s source buffers.
+
+    Stores whose blocks live in different tiers (a fused RAM/flash store) answer per block via
+    ``copy_required_for``; simple stores answer once via the ``copy_required`` class attribute.
+    """
+    per_block = getattr(provider, "copy_required_for", None)
+    if per_block is not None:
+        return bool(per_block(block_idx))
+    return bool(getattr(provider, "copy_required", False))
+
+
 def _is_pinned(t: torch.Tensor) -> bool:
     """Whether ``t`` is pinned (so a ``non_blocking`` H2D copy is truly async). Robust on hosts
     where ``is_pinned`` is unavailable/raises without CUDA."""
@@ -298,22 +310,35 @@ class _BlockOffload:
         prefetched = (
             self._prefetch.take(self.block_idx) if self._prefetch is not None else None
         )
+        # Whoever owns the source buffers also owns the guard that protects them.
+        provider = self._prefetch if prefetched is not None else self._store
+        cuda = self.device.type == "cuda"
         for idx, slot in enumerate(self.slots):
             src = (
                 prefetched[idx]
                 if prefetched is not None
                 else self._store.fetch(self.block_idx, idx)
             )
-            if self._store.copy_required:
-                # FileStore: ``src`` is a reused staging buffer — the staged tensor must be a
-                # fresh copy (never an alias), and the copy is synchronous so the buffer can be
-                # safely rewritten by the next fetch. Bytes identical; only timing differs.
+            if cuda:
+                # A cpu->cuda ``.to()`` ALWAYS materializes a new device tensor, so this can
+                # never alias ``src``. The only hazard is the host rewriting ``src`` while the
+                # copy is in flight — handled by ``record_stage_event`` below, not by blocking.
+                slot.param.data = src.to(self.device, non_blocking=True)
+            elif _copy_required_for(provider, self.block_idx):
+                # Non-CUDA target: ``.to("cpu")`` returns ``src`` itself, so a recycled staging
+                # buffer really would alias. Copy out of it.
                 slot.param.data = src.to(self.device, copy=True)
             else:
                 slot.param.data = src.to(self.device, non_blocking=True)
+        if cuda:
+            # Guard the buffers the copies above are reading; the owner waits on this event
+            # before refilling them. RAMStore's hook is a no-op (its homes are persistent).
+            record = getattr(provider, "record_stage_event", None)
+            if record is not None:
+                record()
         if self._prefetch is not None:
-            # After the copies above (synchronous for reused buffers), it is safe for the
-            # reader to start refilling its buffer set with the predicted next block.
+            # Safe to start reading the predicted next block: the reader alternates buffer sets
+            # and waits on the event just recorded before touching this one again.
             self._prefetch.observe_and_predict(self.block_idx)
         self.staged = True
         cls._resident = self

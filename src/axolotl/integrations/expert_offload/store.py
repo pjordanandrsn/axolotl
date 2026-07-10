@@ -66,6 +66,47 @@ def _aligned_pinned_u8(nbytes: int, pin: bool) -> torch.Tensor:
     return t[off : off + nbytes]
 
 
+class _BufferSet:
+    """One generation of per-slot staging buffers plus the CUDA event that says when the last
+    H2D copies reading them completed.
+
+    Buffers are keyed by **slot index**, never by byte size: a block's slots are read as a group
+    and handed out together, so two same-size slots must not share one buffer (they would clobber
+    each other before either was copied out). Reusing a set waits on its event first.
+    """
+
+    __slots__ = ("bufs", "event", "pinned")
+
+    def __init__(self) -> None:
+        self.bufs: dict[int, torch.Tensor] = {}
+        self.event: torch.cuda.Event | None = None
+        self.pinned = True
+
+    def buffer(self, slot_idx: int, padded: int, pin: bool) -> torch.Tensor:
+        buf = self.bufs.get(slot_idx)
+        if buf is None or buf.numel() < padded:
+            buf = _aligned_pinned_u8(padded, pin=pin)
+            try:
+                self.pinned = self.pinned and buf.is_pinned()
+            except (RuntimeError, AssertionError):  # pragma: no cover
+                self.pinned = False
+            self.bufs[slot_idx] = buf
+        return buf
+
+    def wait(self) -> None:
+        """Block the host until the H2D copies that last read these buffers have finished."""
+        if self.event is not None:
+            self.event.synchronize()
+            self.event = None
+
+    def record(self) -> None:
+        """Mark the H2D copies just enqueued on the current stream as the guard for this set."""
+        if torch.cuda.is_available():
+            ev = torch.cuda.Event()
+            ev.record()
+            self.event = ev
+
+
 class _Record:
     __slots__ = ("offset", "nbytes", "padded", "dtype", "shape")
 
@@ -80,8 +121,12 @@ class _Record:
 class RAMStore:
     """Pinned-CPU homes, exactly as before the seam existed."""
 
-    copy_required = False  # staging may alias the home (CPU target), as today
+    copy_required = False  # homes are persistent; nothing to guard
     mode = "ram"
+
+    def record_stage_event(self) -> None:
+        """No-op: RAM homes are never recycled, so an in-flight H2D cannot be clobbered."""
+        return None
 
     def __init__(self, pin: bool = True):
         self.pin = pin
@@ -130,22 +175,31 @@ class FileStore:
     ``finalize`` and recorded — benchmark artifacts must carry it.
     """
 
-    copy_required = True  # staging buffers are reused; staged params must never alias them
+    # Only meaningful for NON-CUDA targets: ``.to("cpu")`` returns the source tensor itself, so a
+    # staged param would alias a reused staging buffer. CUDA staging is always a real copy.
+    copy_required = True
+
+    _N_SETS = 2  # double buffer: write set B while set A's copies are still in flight
 
     def __init__(self, store_dir: str | None = None, pin: bool = True):
         self.dir = store_dir or tempfile.mkdtemp(prefix="expert_store_")
         os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, "expert_store.bin")
         self.pin = pin
-        self.pinned = pin
         self.mode: str | None = None
         self._records: list[list[_Record]] = []
-        self._staging: dict[int, torch.Tensor] = {}  # padded nbytes -> aligned u8 buffer
+        self._sets = [_BufferSet() for _ in range(self._N_SETS)]
+        self._cur = 0
+        self._cur_block: int | None = None
         self._wfd: int | None = os.open(
             self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
         )
         self._rfd: int | None = None
         self._end = 0
+
+    @property
+    def pinned(self) -> bool:
+        return all(s.pinned for s in self._sets) if self.pin else False
 
     def add_block(self, tensors: list[torch.Tensor]) -> int:
         assert self._wfd is not None, "add_block after finalize"
@@ -198,16 +252,18 @@ class FileStore:
             f"(read mode: {self.mode})"
         )
 
-    def _buffer(self, padded: int) -> torch.Tensor:
-        buf = self._staging.get(padded)
-        if buf is None:
-            buf = _aligned_pinned_u8(padded, pin=self.pin)
-            try:
-                self.pinned = self.pinned and buf.is_pinned()
-            except (RuntimeError, AssertionError):  # pragma: no cover
-                self.pinned = False
-            self._staging[padded] = buf
-        return buf
+    def _set_for(self, block_idx: int) -> _BufferSet:
+        """Rotate to the next buffer set when a new block starts, waiting for the H2D copies that
+        last read it. Within one block every slot keeps its own buffer in the same set."""
+        if block_idx != self._cur_block:
+            self._cur = (self._cur + 1) % self._N_SETS
+            self._sets[self._cur].wait()
+            self._cur_block = block_idx
+        return self._sets[self._cur]
+
+    def record_stage_event(self) -> None:
+        """Called after a block's H2D copies are enqueued: guard the set they read from."""
+        self._sets[self._cur].record()
 
     def _read(self, rec: _Record, buf: torch.Tensor) -> None:
         got = os.preadv(self._rfd, [memoryview(buf.numpy())[: rec.padded]], rec.offset)
@@ -220,13 +276,17 @@ class FileStore:
 
     def fetch(self, block_idx: int, slot_idx: int) -> torch.Tensor:
         rec = self._records[block_idx][slot_idx]
-        buf = self._buffer(rec.padded)
-        self._read(rec, buf)
+        buf = self._set_for(block_idx).buffer(slot_idx, rec.padded, self.pin)
+        self._read(rec, buf[: rec.padded])
         return buf[: rec.nbytes].view(rec.dtype).view(rec.shape)
 
     def state_tensor(self, block_idx: int, slot_idx: int) -> torch.Tensor:
-        # Rare path (full-model save): a fresh tensor, never the reused staging buffer.
-        return self.fetch(block_idx, slot_idx).clone()
+        # Rare path (full-model save): a fresh tensor, and its own buffer, so it never disturbs
+        # the rotating staging sets (which an in-flight H2D may still be reading).
+        rec = self._records[block_idx][slot_idx]
+        buf = _aligned_pinned_u8(rec.padded, pin=False)
+        self._read(rec, buf[: rec.padded])
+        return buf[: rec.nbytes].view(rec.dtype).view(rec.shape).clone()
 
     def block_nbytes(self, block_idx: int) -> int:
         return sum(r.nbytes for r in self._records[block_idx])
@@ -263,6 +323,8 @@ class PrefetchReader:
     stage time on the requesting thread).
     """
 
+    _N_SETS = 2
+
     def __init__(self, store, n_blocks: int):
         self.store = store
         self.n_blocks = n_blocks
@@ -270,19 +332,19 @@ class PrefetchReader:
         self._ready: dict | None = None
         self._last: int | None = None
         self._direction = 1
-        self._buffers: dict[int, torch.Tensor] = {}
+        self._sets = [_BufferSet() for _ in range(self._N_SETS)]
+        self._load_set = 0
+        self._inflight_set: int | None = None
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _buffer(self, slot_idx: int, padded: int) -> torch.Tensor:
-        # One buffer per SLOT INDEX (not per size): a block's slots are read together and
-        # held as a list before any copy, so same-size slots must not share a buffer.
-        buf = self._buffers.get(slot_idx)
-        if buf is None or buf.numel() < padded:
-            buf = _aligned_pinned_u8(padded, pin=getattr(self.store, "pin", False))
-            self._buffers[slot_idx] = buf
-        return buf
+    def record_stage_event(self) -> None:
+        """Guard the set whose buffers the just-enqueued H2D copies are reading, so the reader
+        cannot overwrite them mid-flight."""
+        if self._inflight_set is not None:
+            self._sets[self._inflight_set].record()
+            self._inflight_set = None
 
     def _run(self) -> None:
         while True:
@@ -290,14 +352,22 @@ class PrefetchReader:
             if block_idx is None:  # pragma: no cover - shutdown
                 return
             try:
+                # Alternate sets and wait for any H2D still reading the one we are about to fill.
+                self._load_set = (self._load_set + 1) % self._N_SETS
+                bset = self._sets[self._load_set]
+                bset.wait()
                 recs = self.store._records[block_idx]
                 tensors = []
                 for slot_idx, rec in enumerate(recs):
-                    buf = self._buffer(slot_idx, rec.padded)
+                    buf = bset.buffer(slot_idx, rec.padded, getattr(self.store, "pin", False))
                     self.store._read(rec, buf[: rec.padded])
                     tensors.append(buf[: rec.nbytes].view(rec.dtype).view(rec.shape))
                 with self._lock:
-                    self._ready = {"block": block_idx, "tensors": tensors}
+                    self._ready = {
+                        "block": block_idx,
+                        "tensors": tensors,
+                        "set": self._load_set,
+                    }
             except Exception:  # pragma: no cover - reader must never kill training
                 with self._lock:
                     self._ready = None

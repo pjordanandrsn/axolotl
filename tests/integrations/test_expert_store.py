@@ -92,7 +92,9 @@ class TestFileStoreContracts:
         h0, h1 = handles[0], handles[1]
         h0.stage()
         before = [_sha(p.data) for p in h0.params]
-        buf_ptrs = {b.data_ptr() for b in h0._store._staging.values()}
+        buf_ptrs = {
+            b.data_ptr() for bs in h0._store._sets for b in bs.bufs.values()
+        }
         assert all(p.data.data_ptr() not in buf_ptrs for p in h0.params)
         h0.staged = False  # bypass idempotence guard; force a buffer-overwriting refetch
         h1.stage()  # evicts h0 (single slot) and rewrites the shared staging buffers
@@ -154,10 +156,15 @@ class TestPrefetch:
         model(torch.randn(2, 5, 16), use_ckpt=True).sum().backward()
         assert max_resident == 1  # staged-block invariant UNCHANGED by prefetch
         reader = model._expert_offload_prefetch_reader
-        # host cost is bounded at ONE block's worth of staging buffers (one per slot index),
-        # i.e. the "+1 staged block" contract — not one buffer per block in the model.
+        # Host cost is bounded at TWO blocks' worth of staging buffers: the reader double-buffers
+        # (one set filling while the other's H2D is still in flight), each set holding one buffer
+        # per slot index. GPU peak is unaffected — the staged block count is still 1 (asserted
+        # above); only host RAM grows, by exactly one extra set.
         n_slots_per_block = max(len(h.slots) for h in handles)
-        assert 0 < len(reader._buffers) <= n_slots_per_block
+        assert len(reader._sets) == 2
+        for bset in reader._sets:
+            assert len(bset.bufs) <= n_slots_per_block
+        assert any(bset.bufs for bset in reader._sets)
 
     def test_misprediction_discards_and_falls_back(self, tmp_path):
         torch.manual_seed(0)
@@ -184,3 +191,95 @@ class TestPrefetch:
         model = FakeMoEModel(d=16, n_experts=4, n_layers=2)
         install_expert_offload(model, device="cpu", pin=False, store="ram", prefetch=True)
         assert getattr(model, "_expert_offload_prefetch_reader", None) is None
+
+
+class TestAsyncStaging:
+    """The async-H2D contract: on CUDA every staging path is non_blocking and the source
+    buffers are protected by a recorded event, not by a blocking copy."""
+
+    def test_buffers_are_per_slot_not_per_size(self, tmp_path):
+        """Same-size slots in one block must not share a buffer — they are read as a group and
+        handed out together, so sharing would clobber slot 0 before it was copied out."""
+        m, _ = _build_pair(FakeMoEModel, d=16, n_experts=4, n_layers=2)
+        handles = install_expert_offload(
+            m, device="cpu", pin=False, store="file", store_dir=str(tmp_path)
+        )
+        st = handles[0]._store
+        h = handles[0]
+        tensors = [st.fetch(h.block_idx, i) for i in range(len(h.slots))]
+        ptrs = [t.data_ptr() for t in tensors]
+        assert len(set(ptrs)) == len(ptrs), "slots aliased one buffer"
+        # and their bytes are each individually correct
+        for i, t in enumerate(tensors):
+            assert _sha(t) == _sha(st.state_tensor(h.block_idx, i))
+
+    def test_state_tensor_does_not_disturb_staging_sets(self, tmp_path):
+        """A full-model save while staged must not recycle a set an H2D may still be reading."""
+        m, _ = _build_pair(FakeMoEModel, d=16, n_experts=4, n_layers=3)
+        handles = install_expert_offload(
+            m, device="cpu", pin=False, store="file", store_dir=str(tmp_path)
+        )
+        h = handles[0]
+        h.stage()
+        before = [_sha(p.data) for p in h.params]
+        _ = m.state_dict()  # walks every block via state_tensor
+        assert [_sha(p.data) for p in h.params] == before
+
+    def test_ram_store_has_noop_event_hook(self):
+        m, _ = _build_pair(FakeMoEModel, d=16, n_experts=4, n_layers=2)
+        handles = install_expert_offload(m, device="cpu", pin=False, store="ram")
+        assert handles[0]._store.record_stage_event() is None
+
+    def test_many_stagings_keep_bytes_correct(self, tmp_path):
+        """Hammer the rotating sets: repeated forward/backward must never serve stale bytes."""
+        torch.manual_seed(0)
+        model = FakeMoEModel(d=16, n_experts=4, n_layers=4, lora=True)
+        reference = copy.deepcopy(model)
+        x = torch.randn(2, 5, 16)
+        reference.zero_grad(); out_ref = reference(x, use_ckpt=True); out_ref.sum().backward()
+        ref = {n: p.grad.clone() for n, p in reference.named_parameters() if p.grad is not None}
+        install_expert_offload(
+            model, device="cpu", pin=False, store="file",
+            store_dir=str(tmp_path), prefetch=True,
+        )
+        for _ in range(3):  # several passes -> many set rotations + prefetch turnarounds
+            model.zero_grad()
+            out = model(x, use_ckpt=True)
+            out.sum().backward()
+        assert torch.allclose(out_ref, out, atol=1e-6)
+        got = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        for n in ref:
+            assert torch.allclose(ref[n], got[n], atol=1e-6), n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestAsyncStagingCuda:
+    def test_cuda_staging_records_guard_event(self, tmp_path):
+        m, _ = _build_pair(FakeMoEModel, d=16, n_experts=4, n_layers=3)
+        m = m.cuda()
+        handles = install_expert_offload(
+            m, device="cuda", pin=True, store="file", store_dir=str(tmp_path)
+        )
+        h = handles[0]
+        h.stage()
+        st = h._store
+        assert any(bs.event is not None for bs in st._sets), "no CUDA event guard recorded"
+        assert all(p.data.is_cuda and p.data.numel() > 0 for p in h.params)
+
+    def test_cuda_grads_match_reference_with_prefetch(self, tmp_path):
+        torch.manual_seed(0)
+        model = FakeMoEModel(d=32, n_experts=4, n_layers=3, lora=True).cuda()
+        reference = copy.deepcopy(model)
+        x = torch.randn(2, 5, 32, device="cuda")
+        reference.zero_grad(); o = reference(x, use_ckpt=True); o.sum().backward()
+        ref = {n: p.grad.clone() for n, p in reference.named_parameters() if p.grad is not None}
+        install_expert_offload(
+            model, device="cuda", pin=True, store="file",
+            store_dir=str(tmp_path), prefetch=True,
+        )
+        model.zero_grad(); o2 = model(x, use_ckpt=True); o2.sum().backward()
+        torch.cuda.synchronize()
+        got = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        assert torch.allclose(o, o2, atol=1e-5)
+        for n in ref:
+            assert torch.allclose(ref[n], got[n], atol=1e-5), n
