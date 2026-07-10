@@ -166,13 +166,22 @@ class RAMStore:
     def block_nbytes(self, block_idx: int) -> int:
         return sum(t.numel() * t.element_size() for t in self._blocks[block_idx])
 
-    def fetch_expert(self, block_idx: int, slot_idx: int, expert_id: int) -> torch.Tensor:
-        """One expert's row (dim-0 slice) of a homed [num_experts, ...] tensor — for routed-subset
-        staging, which copies only the routed experts' rows to the GPU."""
-        return self._blocks[block_idx][slot_idx][expert_id]
+    def slot_meta(self, block_idx: int, slot_idx: int):
+        t = self._blocks[block_idx][slot_idx]
+        return tuple(t.shape), t.dtype, t.numel() * t.element_size()
 
-    def n_experts(self, block_idx: int, slot_idx: int) -> int:
-        return int(self._blocks[block_idx][slot_idx].shape[0])
+    def fetch_expert_bytes(
+        self, block_idx: int, slot_idx: int, expert_id: int, n_experts: int
+    ) -> torch.Tensor:
+        """Expert ``expert_id``'s raw bytes (uint8) as a contiguous slice of the packed tensor.
+        Experts are the leading contiguous byte dimension for both the ``[num_experts, ...]`` kit
+        layout and the flat bnb ``quantize_moe_experts`` layout, so expert ``e`` is always
+        ``[e*per : (e+1)*per]`` with ``per = total_bytes // n_experts`` — ``n_experts`` the REAL
+        count from the owning module, NOT ``shape[0]``."""
+        t = self._blocks[block_idx][slot_idx]
+        u8 = t.contiguous().view(torch.uint8).reshape(-1)
+        per = u8.numel() // n_experts
+        return u8[expert_id * per : (expert_id + 1) * per]
 
 
 class FileStore:
@@ -292,19 +301,21 @@ class FileStore:
         self._read(rec, buf[: rec.padded])
         return buf[: rec.nbytes].view(rec.dtype).view(rec.shape)
 
-    def n_experts(self, block_idx: int, slot_idx: int) -> int:
-        return int(self._records[block_idx][slot_idx].shape[0])
-
-    def fetch_expert(self, block_idx: int, slot_idx: int, expert_id: int) -> torch.Tensor:
-        """One expert's row of a packed [num_experts, ...] tensor, read directly from disk — the
-        routed-subset primitive. Reads only expert ``expert_id``'s byte range (an aligned O_DIRECT
-        window when the mode requires it), so flash traffic is the routed subset, not the whole
-        block. Returns a tensor shaped like one expert row (``record.shape[1:]``)."""
+    def slot_meta(self, block_idx: int, slot_idx: int):
         rec = self._records[block_idx][slot_idx]
-        E = rec.shape[0]
-        per = rec.nbytes // E                      # bytes for one expert (dim-0 row)
-        start = rec.offset + expert_id * per        # file offset of this expert
-        # O_DIRECT needs offset+length+buffer all _ALIGN-aligned; read the covering aligned window.
+        return tuple(rec.shape), rec.dtype, rec.nbytes
+
+    def fetch_expert_bytes(
+        self, block_idx: int, slot_idx: int, expert_id: int, n_experts: int
+    ) -> torch.Tensor:
+        """Expert ``expert_id``'s raw bytes (uint8), read directly from disk — only that expert's
+        byte range (an aligned O_DIRECT window), so flash traffic is the routed subset. Experts are
+        the leading contiguous byte dimension; ``per = rec.nbytes // n_experts`` with ``n_experts``
+        the REAL count (from the owning module) — correct for both the flat bnb layout and the
+        ``[num_experts, ...]`` kit layout."""
+        rec = self._records[block_idx][slot_idx]
+        per = rec.nbytes // n_experts
+        start = rec.offset + expert_id * per
         win_start = (start // _ALIGN) * _ALIGN
         win_end = ((start + per + _ALIGN - 1) // _ALIGN) * _ALIGN
         win_len = win_end - win_start
@@ -312,11 +323,10 @@ class FileStore:
         got = os.preadv(self._rfd, [memoryview(buf.numpy())[:win_len]], win_start)
         if got < (start - win_start) + per:  # pragma: no cover - short read is a store bug
             raise IOError(f"short expert read: {got} < {(start-win_start)+per}")
-        if self.mode == "buffered+fadvise":
-            if _HAS_FADVISE:
-                os.posix_fadvise(self._rfd, win_start, win_len, os.POSIX_FADV_DONTNEED)
+        if self.mode == "buffered+fadvise" and _HAS_FADVISE:
+            os.posix_fadvise(self._rfd, win_start, win_len, os.POSIX_FADV_DONTNEED)
         off = start - win_start
-        return buf[off : off + per].view(rec.dtype).view(rec.shape[1:])
+        return buf[off : off + per]
 
     def _expert_buf(self, nbytes: int) -> torch.Tensor:
         b = getattr(self, "_ebuf", None)

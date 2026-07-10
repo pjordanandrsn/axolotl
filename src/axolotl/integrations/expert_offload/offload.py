@@ -257,6 +257,13 @@ class _BlockOffload:
         self._store = store
         self._prefetch: PrefetchReader | None = None
         self._staging: str = "whole_layer"
+        # REAL expert count from the owning module — NOT the packed tensor's shape[0], which is the
+        # flat byte count for the bnb ``quantize_moe_experts`` layout (millions), not the experts.
+        self._n_experts_real = next(
+            (getattr(sl.owner, a) for sl in slots for a in
+             ("num_experts", "n_experts", "num_local_experts") if getattr(sl.owner, a, None)),
+            None,
+        )
         self.block_idx = store.add_block([slot.param.data.detach() for slot in slots])
         if store_owned:
             store.finalize()
@@ -369,21 +376,41 @@ class _BlockOffload:
         return torch.unique(idx).tolist()
 
     def _stage_routed(self, sel) -> None:
-        """Full [num_experts, ...] GPU weight per slot, only the routed rows filled from the store;
-        un-routed rows uninitialized (never indexed) -> bit-identical output."""
+        """Allocate each slot's FULL packed GPU tensor and fill only the routed experts' byte
+        ranges from the store; un-routed regions stay uninitialized (never indexed by the MoE
+        forward) -> bit-identical output. Experts are the leading contiguous byte dimension, so
+        expert ``e`` occupies ``[e*per : (e+1)*per]`` of the flat packed bytes — correct for both
+        the flat bnb layout and the ``[num_experts, ...]`` kit layout, using the REAL expert count
+        (``self._n_experts_real``), never ``shape[0]``."""
+        E = self._n_experts_real
+        if not E:  # can't identify the expert count -> safe fallback to whole-layer
+            return self._stage_whole()
         cuda = self.device.type == "cuda"
         for idx, slot in enumerate(self.slots):
-            E = self._store.n_experts(self.block_idx, idx)
-            row0 = self._store.fetch_expert(self.block_idx, idx, sel[0])
-            full = torch.empty((E, *row0.shape), dtype=row0.dtype, device=self.device)
-            full[sel[0]].copy_(row0.to(self.device, non_blocking=cuda))
-            for e in sel[1:]:
-                full[e].copy_(
-                    self._store.fetch_expert(self.block_idx, idx, e).to(
-                        self.device, non_blocking=cuda
-                    )
-                )
+            shape, dtype, nbytes = self._store.slot_meta(self.block_idx, idx)
+            # FORWARD-ONLY correct: the frozen forward reads only routed experts (proven
+            # step-0 bit-identical to whole-layer). The gradient-checkpoint BACKWARD, however,
+            # reads un-routed rows (zeros -> loss explodes; empty happens to reuse freed memory
+            # ~= real weights -> close but non-deterministic). So routed is correct for INFERENCE
+            # (no_grad) and BLOCKED for training until the backward is made provably sparse.
+            full = torch.empty(shape, dtype=dtype, device=self.device)
+            full_u8 = full.view(torch.uint8).reshape(-1)
+            per = nbytes // E
+            for e in sel:
+                src = self._store.fetch_expert_bytes(self.block_idx, idx, e, E)
+                full_u8[e * per : (e + 1) * per].copy_(src.to(self.device, non_blocking=cuda))
             slot.param.data = full
+        if cuda:
+            record = getattr(self._store, "record_stage_event", None)
+            if record is not None:
+                record()
+
+    def _stage_whole(self) -> None:
+        """Whole-layer staging body reused when routed can't identify the expert count."""
+        cuda = self.device.type == "cuda"
+        for idx, slot in enumerate(self.slots):
+            src = self._store.fetch(self.block_idx, idx)
+            slot.param.data = src.to(self.device, non_blocking=cuda) if cuda else src.to(self.device, copy=True)
         if cuda:
             record = getattr(self._store, "record_stage_event", None)
             if record is not None:
@@ -456,20 +483,24 @@ def install_expert_offload(
     if staging not in ("whole_layer", "routed"):
         raise ValueError(f"expert_offload staging must be whole_layer|routed, got {staging!r}")
     if staging == "routed":
-        # KNOWN DIVERGENCE (2026-07-10): routed-subset is bit-identical to whole-layer on a
-        # lazy fake MoE (tests/integrations/test_expert_store.py::TestRoutedSubsetStaging) but
-        # DIVERGES on the real e4b/transformers training forward — measured OLMoE loss 11.75 vs
-        # 1.214, constant from step 0. Root cause unresolved (args[1] IS the correct top_k_index;
-        # bug is in the staging<->parametrized-forward interaction). Also SLOW: the per-expert
-        # copy loop is a Python-level bottleneck. EXPERIMENTAL — refuse unless explicitly opted in.
+        # STATUS (2026-07-10, root-caused): the original divergence (loss 11.75) was per-expert
+        # ADDRESSING — n_experts read the packed shape[0] (flat byte count under bnb
+        # quantize_moe_experts, millions) instead of the REAL count from the owning module. Fixed
+        # to byte-range addressing with the real count -> the FORWARD is now bit-identical to
+        # whole-layer (verified: real-OLMoE training step-0 loss 0.7038 == 0.7038). REMAINING: the
+        # gradient-checkpoint BACKWARD reads un-routed experts (zeros -> loss explodes; empty
+        # ~= reused real weights -> close but non-deterministic), so TRAINING still diverges past
+        # step 0. So routed is CORRECT FOR INFERENCE (no_grad / decode) and BLOCKED FOR TRAINING
+        # until the backward is made provably sparse. Gated experimental.
         if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
             raise RuntimeError(
-                "expert_offload_staging='routed' is EXPERIMENTAL and currently diverges on the "
-                "real e4b training forward (loss 11.75 vs 1.214, measured 2026-07-10). Use "
-                "whole_layer. Set AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL=1 only for debugging."
+                "expert_offload_staging='routed' is EXPERIMENTAL: forward is bit-identical to "
+                "whole-layer (inference/decode correct), but TRAINING diverges — the "
+                "gradient-checkpoint backward reads un-routed experts. Use whole_layer for "
+                "training; set AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL=1 for inference/debug."
             )
-        LOG.warning("expert_offload_staging=routed is EXPERIMENTAL and known to diverge on the "
-                    "real e4b forward — debugging only, results are NOT correct.")
+        LOG.warning("expert_offload_staging=routed is EXPERIMENTAL: forward-only correct "
+                    "(inference); TRAINING diverges (backward reads un-routed experts).")
     for h in handles:
         h._staging = staging
     if prefetch is None:

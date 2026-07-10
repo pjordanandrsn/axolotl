@@ -384,10 +384,10 @@ class TestRoutedSubsetStaging:
                                          store_dir=str(tmp_path), staging="routed")
         read = set()
         for h in handles:
-            orig = h._store.fetch_expert
-            def wrap(b, s, e, orig=orig):
-                read.add(int(e)); return orig(b, s, e)
-            h._store.fetch_expert = wrap
+            orig = h._store.fetch_expert_bytes
+            def wrap(b, s, e, ne, orig=orig):
+                read.add(int(e)); return orig(b, s, e, ne)
+            h._store.fetch_expert_bytes = wrap
         x = torch.randn(1, 8, 16)
         with torch.no_grad():
             model(x, use_ckpt=False)
