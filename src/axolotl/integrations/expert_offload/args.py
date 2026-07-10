@@ -8,6 +8,8 @@
 
 """Pydantic args for the expert-offload plugin."""
 
+from typing import Literal
+
 from pydantic import BaseModel, model_validator
 
 
@@ -33,6 +35,19 @@ class ExpertOffloadArgs(BaseModel):
     """Home the offloaded expert weights in pinned CPU memory so the per-block host->device copy is
     truly asynchronous. Set false only if pinned memory is scarce (falls back to a correct but
     synchronous pageable copy)."""
+
+    expert_offload_store: Literal["ram", "file"] = "ram"
+    """Where evicted expert blocks live between stagings. ``ram`` (default) keeps each block as a
+    (pinned) CPU tensor — today's behavior. ``file`` writes the packed experts once to a read-only
+    on-disk store and streams blocks back through small reusable (pinned) staging buffers —
+    O_DIRECT when the filesystem supports it, buffered + ``posix_fadvise(DONTNEED)`` otherwise —
+    trading staging latency for a host-RAM footprint of ~one block instead of the whole expert
+    set. Identical bytes and identical math either way; only the source of the copy differs."""
+
+    expert_offload_store_dir: str | None = None
+    """Directory for the ``file`` store's packed experts (``expert_store.bin`` + index). Defaults
+    to a fresh temporary directory. Place it on the fastest LOCAL disk available; a network
+    filesystem here turns every block staging into a network read."""
 
     @model_validator(mode="after")
     def validate_expert_offload_requirements(self):

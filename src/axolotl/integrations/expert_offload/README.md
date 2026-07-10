@@ -7,6 +7,26 @@ Only the frozen experts move. Attention, the router/gate, norms, and the trainab
 stay GPU-resident, so per-step PCIe traffic is limited to the experts — which are the bulk of a
 MoE's parameters and the reason it doesn't fit.
 
+## Storage backends (`expert_offload_store`)
+
+Where evicted blocks live between stagings — the math is identical either way:
+
+- `ram` (default): each block's packed experts are homed as separate (pinned) CPU
+  tensors. Byte-for-byte the original behavior.
+- `file`: the packed experts are written once to a read-only on-disk store
+  (`expert_offload_store_dir`, default a fresh temp dir; use the fastest *local* disk)
+  and streamed back through a small set of reusable (pinned) staging buffers. Host RAM
+  holds ~one block instead of the whole expert set — for Qwen3-30B-A3B that is
+  ~0.3 GB pinned instead of ~14.5 GB. Reads use `O_DIRECT` where the filesystem
+  supports it, else buffered reads + `posix_fadvise(DONTNEED)`; the achieved mode is
+  logged at install. Staging from disk is synchronous and strictly slower than RAM —
+  this trades step time for host-RAM footprint; benchmark on your own storage.
+
+The store abstracts only the *source* of a block's bytes: eviction, the
+single-resident-slot policy, and the gradient-checkpoint recompute contract are
+identical across backends (`tests/integrations/test_expert_store.py` pins byte-parity
+and the no-aliasing contract).
+
 ## How it differs from `layer_offloading` / `activation_offloading`
 
 | Feature | Offloads | Granularity |

@@ -66,6 +66,8 @@ from torch import nn
 
 from axolotl.utils.logging import get_logger
 
+from .store import make_store
+
 LOG = get_logger(__name__)
 
 
@@ -222,17 +224,26 @@ class _BlockOffload:
     # forward AND backward.
     _resident: _BlockOffload | None = None
 
-    def __init__(self, name: str, slots: list[_Slot], device, pin: bool = True):
+    def __init__(
+        self, name: str, slots: list[_Slot], device, pin: bool = True, store=None
+    ):
         self.name = name
         self.device = torch.device(device)
         self.slots = slots
-        # Capture each packed weight as a SEPARATE (pinned) CPU tensor BEFORE any placeholder swap.
-        # The source is on the GPU at install time, so ``.to("cpu")`` is a real device->host copy
-        # that decouples the home from the live parameter we then overwrite with a placeholder.
-        self.homes: list[torch.Tensor] = [
-            self._to_home(slot.param.data.detach(), pin) for slot in slots
-        ]
-        self.pinned = all(_is_pinned(t) for t in self.homes)
+        # Home each packed weight in the store BEFORE any placeholder swap. The source is on
+        # the GPU at install time, so the store's capture is a real device->host copy that
+        # decouples the home from the live parameter we then overwrite with a placeholder.
+        # RAMStore keeps (pinned) CPU tensors exactly as before this seam existed; FileStore
+        # writes the bytes to its packed file and holds no per-block host copy.
+        if store is None:
+            store = make_store(None, None, pin)
+            store_owned = True
+        else:
+            store_owned = False
+        self._store = store
+        self.block_idx = store.add_block([slot.param.data.detach() for slot in slots])
+        if store_owned:
+            store.finalize()
         self.staged = False
         for idx, slot in enumerate(slots):
             self._install_state_dict_hook(slot, idx)
@@ -242,15 +253,9 @@ class _BlockOffload:
     def params(self) -> list[nn.Parameter]:
         return [slot.param for slot in self.slots]
 
-    @staticmethod
-    def _to_home(t: torch.Tensor, pin: bool) -> torch.Tensor:
-        cpu = t.to("cpu")
-        if pin:
-            try:
-                return cpu.pin_memory()
-            except (RuntimeError, AssertionError):  # pragma: no cover - best-effort
-                pass  # pinning is best-effort; pageable fallback is correct, just no async H2D
-        return cpu
+    @property
+    def pinned(self) -> bool:
+        return self._store.pinned
 
     def _install_state_dict_hook(self, slot: _Slot, idx: int) -> None:
         """Keep full-model ``state_dict()`` correct while evicted: substitute the (pinned) CPU home
@@ -262,7 +267,9 @@ class _BlockOffload:
             for key in slot.keys:
                 t = state_dict.get(prefix + key)
                 if t is not None and t.numel() == 0:
-                    state_dict[prefix + key] = self.homes[idx]
+                    state_dict[prefix + key] = self._store.state_tensor(
+                        self.block_idx, idx
+                    )
 
         register = getattr(slot.owner, "register_state_dict_post_hook", None)
         if (
@@ -273,7 +280,7 @@ class _BlockOffload:
 
     @property
     def bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.homes)
+        return self._store.block_nbytes(self.block_idx)
 
     def stage(self) -> None:
         """Copy this block's packed expert weights onto ``device`` (idempotent), first evicting the
@@ -285,8 +292,15 @@ class _BlockOffload:
         cls = type(self)
         if cls._resident is not None and cls._resident is not self:
             cls._resident.evict()  # single-slot: free the prior block before staging this one
-        for slot, home in zip(self.slots, self.homes, strict=True):
-            slot.param.data = home.to(self.device, non_blocking=True)
+        for idx, slot in enumerate(self.slots):
+            src = self._store.fetch(self.block_idx, idx)
+            if self._store.copy_required:
+                # FileStore: ``src`` is a reused staging buffer — the staged tensor must be a
+                # fresh copy (never an alias), and the copy is synchronous so the buffer can be
+                # safely rewritten by the next fetch. Bytes identical; only timing differs.
+                slot.param.data = src.to(self.device, copy=True)
+            else:
+                slot.param.data = src.to(self.device, non_blocking=True)
         self.staged = True
         cls._resident = self
 
@@ -302,7 +316,11 @@ class _BlockOffload:
 
 
 def install_expert_offload(
-    model: nn.Module, device=None, pin: bool = True
+    model: nn.Module,
+    device=None,
+    pin: bool = True,
+    store: str | None = None,
+    store_dir: str | None = None,
 ) -> list[_BlockOffload]:
     """Offload every discoverable MoE block's frozen 4-bit experts to (pinned) CPU RAM.
 
@@ -338,11 +356,13 @@ def install_expert_offload(
         device = slot_blocks[0][2][0].param.data.device
     device = torch.device(device)
 
+    store = make_store(store, store_dir, pin)
     handles: list[_BlockOffload] = []
     for name, block, slots in slot_blocks:
-        handle = _BlockOffload(name, slots, device, pin=pin)
+        handle = _BlockOffload(name, slots, device, pin=pin, store=store)
         block.register_forward_pre_hook(lambda module, args, h=handle: h.stage())
         handles.append(handle)
+    store.finalize()
 
     model._expert_offload_handles = handles
     _register_ddp_ignore(model, handles)
@@ -354,9 +374,14 @@ def install_expert_offload(
         if torch.distributed.is_available() and torch.distributed.is_initialized()
         else ""
     )
+    where = (
+        f"{pinned} CPU RAM"
+        if store.mode == "ram"
+        else f"disk ({store.mode}; staging {pinned})"
+    )
     LOG.info(
         f"expert_offload{rank}: homed {n_experts} expert layers across {len(handles)} MoE blocks "
-        f"({total_gb:.2f} GB) to {pinned} CPU RAM; one block resident on {device} at a time."
+        f"({total_gb:.2f} GB) to {where}; one block resident on {device} at a time."
     )
     return handles
 

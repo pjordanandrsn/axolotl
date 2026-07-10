@@ -34,5 +34,8 @@ class ExpertOffloadPlugin(BasePlugin):
         from .offload import install_expert_offload
 
         install_expert_offload(
-            model, pin=getattr(cfg, "expert_offload_pin_memory", True)
+            model,
+            pin=getattr(cfg, "expert_offload_pin_memory", True),
+            store=getattr(cfg, "expert_offload_store", None),
+            store_dir=getattr(cfg, "expert_offload_store_dir", None),
         )
