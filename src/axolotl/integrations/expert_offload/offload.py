@@ -371,7 +371,8 @@ def install_expert_offload(
         device = slot_blocks[0][2][0].param.data.device
     device = torch.device(device)
 
-    store = make_store(store, store_dir, pin)
+    if store is None or isinstance(store, str):
+        store = make_store(store, store_dir, pin)
     handles: list[_BlockOffload] = []
     for name, block, slots in slot_blocks:
         handle = _BlockOffload(name, slots, device, pin=pin, store=store)
