@@ -455,6 +455,21 @@ def install_expert_offload(
         staging = os.environ.get("AXOLOTL_EXPERT_OFFLOAD_STAGING", "") or "whole_layer"
     if staging not in ("whole_layer", "routed"):
         raise ValueError(f"expert_offload staging must be whole_layer|routed, got {staging!r}")
+    if staging == "routed":
+        # KNOWN DIVERGENCE (2026-07-10): routed-subset is bit-identical to whole-layer on a
+        # lazy fake MoE (tests/integrations/test_expert_store.py::TestRoutedSubsetStaging) but
+        # DIVERGES on the real e4b/transformers training forward — measured OLMoE loss 11.75 vs
+        # 1.214, constant from step 0. Root cause unresolved (args[1] IS the correct top_k_index;
+        # bug is in the staging<->parametrized-forward interaction). Also SLOW: the per-expert
+        # copy loop is a Python-level bottleneck. EXPERIMENTAL — refuse unless explicitly opted in.
+        if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
+            raise RuntimeError(
+                "expert_offload_staging='routed' is EXPERIMENTAL and currently diverges on the "
+                "real e4b training forward (loss 11.75 vs 1.214, measured 2026-07-10). Use "
+                "whole_layer. Set AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL=1 only for debugging."
+            )
+        LOG.warning("expert_offload_staging=routed is EXPERIMENTAL and known to diverge on the "
+                    "real e4b forward — debugging only, results are NOT correct.")
     for h in handles:
         h._staging = staging
     if prefetch is None:

@@ -50,7 +50,12 @@ class ExpertOffloadArgs(BaseModel):
     weight is allocated but only routed rows are filled from the store, so per-forward staging
     traffic is ``read_fraction`` x the layer instead of the whole layer. Bit-identical output
     (un-routed rows are never indexed). ``routed`` runs synchronously (no prefetch — the routing
-    is not known a block ahead)."""
+    is not known a block ahead).
+
+    KNOWN ISSUE (2026-07-10): ``routed`` is bit-identical to whole-layer on a lazy fake MoE but
+    DIVERGES on the real e4b/transformers training forward (measured OLMoE loss 11.75 vs 1.214).
+    It is gated behind AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL=1 and must not be used in
+    production until the divergence is root-caused. Default whole_layer is correct and validated."""
 
     expert_offload_prefetch: bool = False
     """(``file`` store only) Read the predicted next block's bytes from disk into a second
