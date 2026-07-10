@@ -294,7 +294,7 @@ class TestAsyncStagingCuda:
 import torch.nn.functional as _F  # noqa: E402
 from torch.nn.utils import parametrize as _parametrize  # noqa: E402
 
-from test_expert_offload import Bnb4bitParametrization  # noqa: E402
+from .test_expert_offload import Bnb4bitParametrization  # noqa: E402
 
 
 class SparseGroupedExperts(torch.nn.Module):
