@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import tempfile
+import threading
 
 import torch
 
@@ -240,3 +242,87 @@ def make_store(kind: str | None, store_dir: str | None, pin: bool):
     if kind == "file":
         return FileStore(store_dir=store_dir, pin=pin)
     raise ValueError(f"unknown expert_offload store: {kind!r} (expected 'ram' or 'file')")
+
+
+class PrefetchReader:
+    """One background reader that loads block ``N±1``'s bytes into a second staging-buffer
+    set while block ``N`` computes (Phase C of the store seam; ``expert_offload_prefetch``).
+
+    Deterministic schedule, direction-aware: forward passes stage blocks in ascending
+    order, but under ``use_reentrant=False`` gradient checkpointing the backward pass
+    *recomputes* blocks in descending order — so the predictor follows the observed
+    direction of the last two stagings. A prediction can only ever be wrong at the two
+    turnaround points; a prefetch that does not match the block actually requested is
+    discarded and that staging falls back to the synchronous path. Bytes are identical
+    either way — prefetch moves them earlier in time, never changes them.
+
+    The reader owns a SECOND buffer set (``buffers``); the store's own staging buffers
+    remain the synchronous path's. Consumption hands the prefetched CPU tensor to the
+    caller and swaps the set back for the next prediction, so at most one prefetched
+    block exists at a time (host RAM: +1 block; GPU: unchanged — H2D still happens at
+    stage time on the requesting thread).
+    """
+
+    def __init__(self, store, n_blocks: int):
+        self.store = store
+        self.n_blocks = n_blocks
+        self._q: queue.Queue = queue.Queue(maxsize=1)
+        self._ready: dict | None = None
+        self._last: int | None = None
+        self._direction = 1
+        self._buffers: dict[int, torch.Tensor] = {}
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _buffer(self, slot_idx: int, padded: int) -> torch.Tensor:
+        # One buffer per SLOT INDEX (not per size): a block's slots are read together and
+        # held as a list before any copy, so same-size slots must not share a buffer.
+        buf = self._buffers.get(slot_idx)
+        if buf is None or buf.numel() < padded:
+            buf = _aligned_pinned_u8(padded, pin=getattr(self.store, "pin", False))
+            self._buffers[slot_idx] = buf
+        return buf
+
+    def _run(self) -> None:
+        while True:
+            block_idx = self._q.get()
+            if block_idx is None:  # pragma: no cover - shutdown
+                return
+            try:
+                recs = self.store._records[block_idx]
+                tensors = []
+                for slot_idx, rec in enumerate(recs):
+                    buf = self._buffer(slot_idx, rec.padded)
+                    self.store._read(rec, buf[: rec.padded])
+                    tensors.append(buf[: rec.nbytes].view(rec.dtype).view(rec.shape))
+                with self._lock:
+                    self._ready = {"block": block_idx, "tensors": tensors}
+            except Exception:  # pragma: no cover - reader must never kill training
+                with self._lock:
+                    self._ready = None
+
+    def observe_and_predict(self, block_idx: int) -> None:
+        """Called after each staging: update direction, kick the next read."""
+        if self._last is not None and block_idx != self._last:
+            self._direction = 1 if block_idx > self._last else -1
+        self._last = block_idx
+        nxt = block_idx + self._direction
+        if 0 <= nxt < self.n_blocks and self._q.empty():
+            with self._lock:
+                pending = self._ready
+            if pending is None or pending.get("block") != nxt:
+                try:
+                    self._q.put_nowait(nxt)
+                except queue.Full:  # pragma: no cover
+                    pass
+
+    def take(self, block_idx: int) -> list[torch.Tensor] | None:
+        """The prefetched tensors for ``block_idx`` if (and only if) the prediction matched;
+        None otherwise. Never blocks on the reader."""
+        with self._lock:
+            ready = self._ready
+            if ready is not None and ready["block"] == block_idx:
+                self._ready = None
+                return ready["tensors"]
+        return None

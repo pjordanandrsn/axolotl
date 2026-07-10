@@ -105,3 +105,82 @@ class TestFileStoreContracts:
         m, _ = _build_pair(FakeMoEModel, d=16, n_experts=4, n_layers=2)
         handles = install_expert_offload(m, device="cpu", pin=False)
         assert isinstance(handles[0]._store, RAMStore)
+
+
+class TestPrefetch:
+    """Phase C: deterministic host-side double-buffer over FileStore."""
+
+    def _train_grads(self, model, x):
+        model.zero_grad()
+        out = model(x, use_ckpt=True)
+        out.sum().backward()
+        return out, {
+            n: p.grad.clone()
+            for n, p in model.named_parameters()
+            if p.grad is not None
+        }
+
+    def test_prefetch_grads_match_reference(self, tmp_path):
+        torch.manual_seed(0)
+        model = FakeMoEModel(d=16, n_experts=4, n_layers=3, lora=True)
+        reference = copy.deepcopy(model)
+        x = torch.randn(2, 5, 16)
+        out_ref, ref_grads = self._train_grads(reference, x)
+        install_expert_offload(
+            model, device="cpu", pin=False,
+            store="file", store_dir=str(tmp_path), prefetch=True,
+        )
+        assert getattr(model, "_expert_offload_prefetch_reader", None) is not None
+        out, grads = self._train_grads(model, x)
+        assert torch.allclose(out_ref, out, atol=1e-6)
+        assert set(ref_grads) == set(grads) and len(grads) > 0
+        for name, g in ref_grads.items():
+            assert torch.allclose(g, grads[name], atol=1e-6), name
+
+    def test_prefetch_residency_and_buffer_accounting(self, tmp_path):
+        torch.manual_seed(0)
+        model = FakeMoEModel(d=16, n_experts=4, n_layers=4)
+        handles = install_expert_offload(
+            model, device="cpu", pin=False,
+            store="file", store_dir=str(tmp_path), prefetch=True,
+        )
+        max_resident = 0
+        from axolotl.integrations.expert_offload.offload import find_moe_expert_blocks
+        def probe(_m, _a):
+            nonlocal max_resident
+            max_resident = max(max_resident, sum(h.staged for h in handles))
+        for _n, block, _b in find_moe_expert_blocks(model):
+            block.register_forward_pre_hook(probe)
+        model(torch.randn(2, 5, 16), use_ckpt=True).sum().backward()
+        assert max_resident == 1  # staged-block invariant UNCHANGED by prefetch
+        reader = model._expert_offload_prefetch_reader
+        # host cost is bounded at ONE block's worth of staging buffers (one per slot index),
+        # i.e. the "+1 staged block" contract — not one buffer per block in the model.
+        n_slots_per_block = max(len(h.slots) for h in handles)
+        assert 0 < len(reader._buffers) <= n_slots_per_block
+
+    def test_misprediction_discards_and_falls_back(self, tmp_path):
+        torch.manual_seed(0)
+        model = FakeMoEModel(d=16, n_experts=4, n_layers=3)
+        handles = install_expert_offload(
+            model, device="cpu", pin=False,
+            store="file", store_dir=str(tmp_path), prefetch=True,
+        )
+        import time
+        # stage out of any monotone order: 0, 2, 1, 0 — turnarounds force mispredictions
+        for target in (0, 2, 1, 0):
+            for h in handles:
+                h.staged = False
+            handles[target].stage()
+            time.sleep(0.05)  # let the reader land a (possibly wrong) prediction
+            got = [_sha(p.data) for p in handles[target].params]
+            want = [
+                _sha(handles[target]._store.fetch(handles[target].block_idx, i))
+                for i in range(len(handles[target].slots))
+            ]
+            assert got == want, f"bytes wrong after staging block {target}"
+
+    def test_prefetch_is_noop_on_ram_store(self):
+        model = FakeMoEModel(d=16, n_experts=4, n_layers=2)
+        install_expert_offload(model, device="cpu", pin=False, store="ram", prefetch=True)
+        assert getattr(model, "_expert_offload_prefetch_reader", None) is None

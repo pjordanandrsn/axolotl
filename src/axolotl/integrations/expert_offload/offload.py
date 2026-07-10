@@ -59,6 +59,8 @@ stage/evict swaps; the config schema refuses to enable under any of them.
 
 from __future__ import annotations
 
+import os
+
 from typing import NamedTuple
 
 import torch
@@ -66,7 +68,7 @@ from torch import nn
 
 from axolotl.utils.logging import get_logger
 
-from .store import make_store
+from .store import FileStore, PrefetchReader, make_store
 
 LOG = get_logger(__name__)
 
@@ -241,6 +243,7 @@ class _BlockOffload:
         else:
             store_owned = False
         self._store = store
+        self._prefetch: PrefetchReader | None = None
         self.block_idx = store.add_block([slot.param.data.detach() for slot in slots])
         if store_owned:
             store.finalize()
@@ -292,8 +295,15 @@ class _BlockOffload:
         cls = type(self)
         if cls._resident is not None and cls._resident is not self:
             cls._resident.evict()  # single-slot: free the prior block before staging this one
+        prefetched = (
+            self._prefetch.take(self.block_idx) if self._prefetch is not None else None
+        )
         for idx, slot in enumerate(self.slots):
-            src = self._store.fetch(self.block_idx, idx)
+            src = (
+                prefetched[idx]
+                if prefetched is not None
+                else self._store.fetch(self.block_idx, idx)
+            )
             if self._store.copy_required:
                 # FileStore: ``src`` is a reused staging buffer — the staged tensor must be a
                 # fresh copy (never an alias), and the copy is synchronous so the buffer can be
@@ -301,6 +311,10 @@ class _BlockOffload:
                 slot.param.data = src.to(self.device, copy=True)
             else:
                 slot.param.data = src.to(self.device, non_blocking=True)
+        if self._prefetch is not None:
+            # After the copies above (synchronous for reused buffers), it is safe for the
+            # reader to start refilling its buffer set with the predicted next block.
+            self._prefetch.observe_and_predict(self.block_idx)
         self.staged = True
         cls._resident = self
 
@@ -321,6 +335,7 @@ def install_expert_offload(
     pin: bool = True,
     store: str | None = None,
     store_dir: str | None = None,
+    prefetch: bool | None = None,
 ) -> list[_BlockOffload]:
     """Offload every discoverable MoE block's frozen 4-bit experts to (pinned) CPU RAM.
 
@@ -363,6 +378,18 @@ def install_expert_offload(
         block.register_forward_pre_hook(lambda module, args, h=handle: h.stage())
         handles.append(handle)
     store.finalize()
+    if prefetch is None:
+        prefetch = os.environ.get("AXOLOTL_EXPERT_OFFLOAD_PREFETCH", "") == "1"
+    if prefetch and isinstance(store, FileStore):
+        reader = PrefetchReader(store, len(handles))
+        for handle in handles:
+            handle._prefetch = reader
+        model._expert_offload_prefetch_reader = reader  # keep-alive + test introspection
+    elif prefetch:
+        LOG.info(
+            "expert_offload: prefetch requested but the store is RAM-backed — nothing to "
+            "read ahead of the pinned homes; running without a reader."
+        )
 
     model._expert_offload_handles = handles
     _register_ddp_ignore(model, handles)

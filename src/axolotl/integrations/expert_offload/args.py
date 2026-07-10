@@ -44,6 +44,15 @@ class ExpertOffloadArgs(BaseModel):
     trading staging latency for a host-RAM footprint of ~one block instead of the whole expert
     set. Identical bytes and identical math either way; only the source of the copy differs."""
 
+    expert_offload_prefetch: bool = False
+    """(``file`` store only) Read the predicted next block's bytes from disk into a second
+    staging-buffer set while the current block computes — a deterministic double-buffer
+    that hides disk latency behind compute. Direction-aware: follows the forward
+    (ascending) and gradient-checkpoint recompute (descending) staging orders; a
+    mispredicted block is simply discarded and that staging falls back to the synchronous
+    read. Host RAM +one block's staging buffers; GPU footprint unchanged. No effect on
+    the ``ram`` store."""
+
     expert_offload_store_dir: str | None = None
     """Directory for the ``file`` store's packed experts (``expert_store.bin`` + index). Defaults
     to a fresh temporary directory. Place it on the fastest LOCAL disk available; a network

@@ -38,4 +38,5 @@ class ExpertOffloadPlugin(BasePlugin):
             pin=getattr(cfg, "expert_offload_pin_memory", True),
             store=getattr(cfg, "expert_offload_store", None),
             store_dir=getattr(cfg, "expert_offload_store_dir", None),
+            prefetch=getattr(cfg, "expert_offload_prefetch", None),
         )
