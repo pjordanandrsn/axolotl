@@ -256,6 +256,7 @@ class _BlockOffload:
             store_owned = False
         self._store = store
         self._prefetch: PrefetchReader | None = None
+        self._staging: str = "whole_layer"
         self.block_idx = store.add_block([slot.param.data.detach() for slot in slots])
         if store_owned:
             store.finalize()
@@ -297,16 +298,26 @@ class _BlockOffload:
     def bytes(self) -> int:
         return self._store.block_nbytes(self.block_idx)
 
-    def stage(self) -> None:
+    def stage(self, args=None) -> None:
         """Copy this block's packed expert weights onto ``device`` (idempotent), first evicting the
-        previously staged block so at most one block's experts are GPU-resident. The H2D copies are
-        enqueued on the current stream, so the dequant kernels that immediately follow are ordered
-        after them."""
+        previously staged block so at most one block's experts are GPU-resident.
+
+        ``staging="routed"`` stages ONLY the experts this forward routes to (the distinct union of
+        ``args[1]`` = ``top_k_index``): a full-size GPU weight is allocated but only the routed rows
+        are filled from the store, so flash/H2D traffic is ``read_fraction`` x the layer. Un-routed
+        rows are never indexed by the MoE forward, so the output is bit-identical to whole-layer."""
         if self.staged:
             return
         cls = type(self)
         if cls._resident is not None and cls._resident is not self:
             cls._resident.evict()  # single-slot: free the prior block before staging this one
+        if self._staging == "routed":
+            sel = self._routed_experts(args)
+            if sel is not None:
+                self._stage_routed(sel)
+                self.staged = True
+                cls._resident = self
+                return
         prefetched = (
             self._prefetch.take(self.block_idx) if self._prefetch is not None else None
         )
@@ -343,6 +354,41 @@ class _BlockOffload:
         self.staged = True
         cls._resident = self
 
+    @staticmethod
+    def _routed_experts(args):
+        """The distinct experts this forward routes to, from the experts module's
+        ``(hidden, top_k_index, top_k_weights)`` args. Sorted list, or None to fall back to
+        whole-layer (no integer routing tensor available)."""
+        if not args or len(args) < 2:
+            return None
+        idx = args[1]
+        if not isinstance(idx, torch.Tensor) or idx.dtype not in (
+            torch.int32, torch.int64, torch.long,
+        ):
+            return None
+        return torch.unique(idx).tolist()
+
+    def _stage_routed(self, sel) -> None:
+        """Full [num_experts, ...] GPU weight per slot, only the routed rows filled from the store;
+        un-routed rows uninitialized (never indexed) -> bit-identical output."""
+        cuda = self.device.type == "cuda"
+        for idx, slot in enumerate(self.slots):
+            E = self._store.n_experts(self.block_idx, idx)
+            row0 = self._store.fetch_expert(self.block_idx, idx, sel[0])
+            full = torch.empty((E, *row0.shape), dtype=row0.dtype, device=self.device)
+            full[sel[0]].copy_(row0.to(self.device, non_blocking=cuda))
+            for e in sel[1:]:
+                full[e].copy_(
+                    self._store.fetch_expert(self.block_idx, idx, e).to(
+                        self.device, non_blocking=cuda
+                    )
+                )
+            slot.param.data = full
+        if cuda:
+            record = getattr(self._store, "record_stage_event", None)
+            if record is not None:
+                record()
+
     def evict(self) -> None:
         """Point this block's expert weights back at shared 0-element placeholders (idempotent),
         dropping the GPU copies so the caching allocator can reuse the memory for the next block."""
@@ -361,6 +407,7 @@ def install_expert_offload(
     store: str | None = None,
     store_dir: str | None = None,
     prefetch: bool | None = None,
+    staging: str | None = None,
 ) -> list[_BlockOffload]:
     """Offload every discoverable MoE block's frozen 4-bit experts to (pinned) CPU RAM.
 
@@ -401,11 +448,21 @@ def install_expert_offload(
     handles: list[_BlockOffload] = []
     for name, block, slots in slot_blocks:
         handle = _BlockOffload(name, slots, device, pin=pin, store=store)
-        block.register_forward_pre_hook(lambda module, args, h=handle: h.stage())
+        block.register_forward_pre_hook(lambda module, args, h=handle: h.stage(args))
         handles.append(handle)
     store.finalize()
+    if staging is None:
+        staging = os.environ.get("AXOLOTL_EXPERT_OFFLOAD_STAGING", "") or "whole_layer"
+    if staging not in ("whole_layer", "routed"):
+        raise ValueError(f"expert_offload staging must be whole_layer|routed, got {staging!r}")
+    for h in handles:
+        h._staging = staging
     if prefetch is None:
         prefetch = os.environ.get("AXOLOTL_EXPERT_OFFLOAD_PREFETCH", "") == "1"
+    if prefetch and staging == "routed":
+        LOG.info("expert_offload: staging=routed disables prefetch (per-forward routing not "
+                 "predictable a block ahead); routed-subset staging runs synchronous.")
+        prefetch = False
     if prefetch and isinstance(store, FileStore):
         reader = PrefetchReader(store, len(handles))
         for handle in handles:

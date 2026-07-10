@@ -44,6 +44,14 @@ class ExpertOffloadArgs(BaseModel):
     trading staging latency for a host-RAM footprint of ~one block instead of the whole expert
     set. Identical bytes and identical math either way; only the source of the copy differs."""
 
+    expert_offload_staging: str = "whole_layer"
+    """``whole_layer`` (default) stages every visited layer's ENTIRE expert stack. ``routed``
+    stages only the experts this forward routes to (the distinct top-k union): a full-size GPU
+    weight is allocated but only routed rows are filled from the store, so per-forward staging
+    traffic is ``read_fraction`` x the layer instead of the whole layer. Bit-identical output
+    (un-routed rows are never indexed). ``routed`` runs synchronously (no prefetch — the routing
+    is not known a block ahead)."""
+
     expert_offload_prefetch: bool = False
     """(``file`` store only) Read the predicted next block's bytes from disk into a second
     staging-buffer set while the current block computes — a deterministic double-buffer

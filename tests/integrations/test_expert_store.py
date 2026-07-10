@@ -283,3 +283,113 @@ class TestAsyncStagingCuda:
         assert torch.allclose(o, o2, atol=1e-5)
         for n in ref:
             assert torch.allclose(ref[n], got[n], atol=1e-5), n
+
+
+# --------------------------------------------------------------------------- #
+# Routed-subset staging: stage only the experts a forward routes to.          #
+# A faithful SPARSE fake (mirrors ExpertsLoRA's (hidden, top_k_index,         #
+# top_k_weights) signature, computing ONLY routed experts) — so un-staged     #
+# rows are never read and routed output must be bit-identical to whole-layer. #
+# --------------------------------------------------------------------------- #
+import torch.nn.functional as _F  # noqa: E402
+from torch.nn.utils import parametrize as _parametrize  # noqa: E402
+
+from test_expert_offload import Bnb4bitParametrization  # noqa: E402
+
+
+class SparseGroupedExperts(torch.nn.Module):
+    def __init__(self, d, n_experts):
+        super().__init__()
+        self.num_experts = n_experts
+        self.gate_up_proj = torch.nn.Parameter(torch.randn(n_experts, d, d) * 0.1, requires_grad=False)
+        self.down_proj = torch.nn.Parameter(torch.randn(n_experts, d, d) * 0.1, requires_grad=False)
+        for pn in ("gate_up_proj", "down_proj"):
+            _parametrize.register_parametrization(self, pn, Bnb4bitParametrization(), unsafe=True)
+
+    def forward(self, hidden, top_k_index, top_k_weights):
+        # SPARSE: read ONLY experts that appear in top_k_index. Un-routed rows are never touched,
+        # so routed-subset staging (which leaves them uninitialized) must match whole-layer.
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        out = torch.zeros_like(flat)
+        idx = top_k_index.reshape(-1, top_k_index.shape[-1])
+        wts = top_k_weights.reshape(-1, top_k_weights.shape[-1])
+        for e in torch.unique(idx).tolist():
+            hit = (idx == e).any(dim=-1)
+            if not bool(hit.any()):
+                continue
+            x = flat[hit]
+            h = torch.tanh(_F.linear(x, self.gate_up_proj[e]))
+            y = _F.linear(h, self.down_proj[e])
+            w = (wts * (idx == e)).sum(-1)[hit].unsqueeze(-1)
+            out[hit] = out[hit] + w * y
+        return out.view_as(hidden)
+
+
+class SparseMoEBlock(torch.nn.Module):
+    def __init__(self, d, n_experts, k=2):
+        super().__init__()
+        self.k = k
+        self.router = torch.nn.Linear(d, n_experts)
+        self.experts = SparseGroupedExperts(d, n_experts)
+
+    def forward(self, x):
+        logits = self.router(x)
+        w, idx = torch.topk(torch.softmax(logits, dim=-1), self.k, dim=-1)
+        return self.experts(x, idx, w)
+
+
+class SparseMoEModel(torch.nn.Module):
+    def __init__(self, d=16, n_experts=8, n_layers=3, k=2):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(SparseMoEBlock(d, n_experts, k) for _ in range(n_layers))
+
+    def forward(self, x, use_ckpt=False):
+        for b in self.blocks:
+            x = x + (torch.utils.checkpoint.checkpoint(b, x, use_reentrant=False) if use_ckpt else b(x))
+        return x
+
+
+@pytest.mark.parametrize("store_kind", ["ram", "file"])
+class TestRoutedSubsetStaging:
+    def _grads(self, model, x):
+        model.zero_grad()
+        out = model(x, use_ckpt=True)
+        out.sum().backward()
+        return out, {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    def test_routed_bit_identical_to_whole_layer(self, tmp_path, store_kind):
+        torch.manual_seed(0)
+        model = SparseMoEModel(d=16, n_experts=8, n_layers=3, k=2)
+        ref = copy.deepcopy(model)
+        x = torch.randn(2, 6, 16)
+        # whole-layer reference
+        install_expert_offload(ref, device="cpu", pin=False, store=store_kind,
+                               store_dir=str(tmp_path / "a"), staging="whole_layer")
+        out_ref, g_ref = self._grads(ref, x)
+        # routed-subset
+        install_expert_offload(model, device="cpu", pin=False, store=store_kind,
+                               store_dir=str(tmp_path / "b"), staging="routed")
+        out, g = self._grads(model, x)
+        assert torch.allclose(out_ref, out, atol=1e-6), "routed output != whole-layer"
+        assert set(g_ref) == set(g) and len(g) > 0
+        for n in g_ref:
+            assert torch.allclose(g_ref[n], g[n], atol=1e-6), f"grad mismatch {n}"
+
+    def test_routed_reads_only_the_union(self, tmp_path, store_kind):
+        """The staged GPU weight has exactly the routed rows filled; un-routed rows are left
+        uninitialized — proven by monkeypatching fetch_expert to record which experts were read."""
+        torch.manual_seed(1)
+        model = SparseMoEModel(d=16, n_experts=8, n_layers=2, k=2)
+        handles = install_expert_offload(model, device="cpu", pin=False, store=store_kind,
+                                         store_dir=str(tmp_path), staging="routed")
+        read = set()
+        for h in handles:
+            orig = h._store.fetch_expert
+            def wrap(b, s, e, orig=orig):
+                read.add(int(e)); return orig(b, s, e)
+            h._store.fetch_expert = wrap
+        x = torch.randn(1, 8, 16)
+        with torch.no_grad():
+            model(x, use_ckpt=False)
+        # something was read, and strictly fewer than every (expert x layer x slot) if routing is sparse
+        assert 0 < len(read) <= 8

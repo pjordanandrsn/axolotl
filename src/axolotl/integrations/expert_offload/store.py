@@ -42,6 +42,8 @@ from axolotl.utils.logging import get_logger
 LOG = get_logger(__name__)
 
 _ALIGN = 4096  # O_DIRECT alignment (offset, length, buffer address)
+_O_DIRECT = getattr(os, "O_DIRECT", 0)  # Linux-only; 0 (no-op) elsewhere -> buffered fallback
+_HAS_FADVISE = hasattr(os, "posix_fadvise")
 
 
 def _pad(n: int) -> int:
@@ -164,6 +166,14 @@ class RAMStore:
     def block_nbytes(self, block_idx: int) -> int:
         return sum(t.numel() * t.element_size() for t in self._blocks[block_idx])
 
+    def fetch_expert(self, block_idx: int, slot_idx: int, expert_id: int) -> torch.Tensor:
+        """One expert's row (dim-0 slice) of a homed [num_experts, ...] tensor — for routed-subset
+        staging, which copies only the routed experts' rows to the GPU."""
+        return self._blocks[block_idx][slot_idx][expert_id]
+
+    def n_experts(self, block_idx: int, slot_idx: int) -> int:
+        return int(self._blocks[block_idx][slot_idx].shape[0])
+
 
 class FileStore:
     """Packed experts on disk; small reusable (pinned) staging buffers in host RAM.
@@ -238,7 +248,9 @@ class FileStore:
                 fh,
             )
         try:
-            self._rfd = os.open(self.path, os.O_RDONLY | os.O_DIRECT)
+            if not _O_DIRECT:
+                raise OSError("O_DIRECT unavailable on this platform")
+            self._rfd = os.open(self.path, os.O_RDONLY | _O_DIRECT)
             probe = _aligned_pinned_u8(_ALIGN, pin=False)
             os.preadv(self._rfd, [memoryview(probe.numpy())], 0)
             self.mode = "odirect"
@@ -246,7 +258,7 @@ class FileStore:
             if self._rfd is not None:
                 os.close(self._rfd)
             self._rfd = os.open(self.path, os.O_RDONLY)
-            self.mode = "buffered+fadvise"
+            self.mode = "buffered+fadvise" if _HAS_FADVISE else "buffered"
         LOG.info(
             f"expert_offload FileStore: {self._end / 1e9:.2f} GB at {self.path} "
             f"(read mode: {self.mode})"
@@ -269,7 +281,7 @@ class FileStore:
         got = os.preadv(self._rfd, [memoryview(buf.numpy())[: rec.padded]], rec.offset)
         if got < rec.nbytes:  # pragma: no cover - short read is a store bug
             raise IOError(f"short read: {got} < {rec.nbytes} at {rec.offset}")
-        if self.mode == "buffered+fadvise":
+        if self.mode == "buffered+fadvise" and _HAS_FADVISE:
             os.posix_fadvise(
                 self._rfd, rec.offset, rec.padded, os.POSIX_FADV_DONTNEED
             )
@@ -279,6 +291,39 @@ class FileStore:
         buf = self._set_for(block_idx).buffer(slot_idx, rec.padded, self.pin)
         self._read(rec, buf[: rec.padded])
         return buf[: rec.nbytes].view(rec.dtype).view(rec.shape)
+
+    def n_experts(self, block_idx: int, slot_idx: int) -> int:
+        return int(self._records[block_idx][slot_idx].shape[0])
+
+    def fetch_expert(self, block_idx: int, slot_idx: int, expert_id: int) -> torch.Tensor:
+        """One expert's row of a packed [num_experts, ...] tensor, read directly from disk — the
+        routed-subset primitive. Reads only expert ``expert_id``'s byte range (an aligned O_DIRECT
+        window when the mode requires it), so flash traffic is the routed subset, not the whole
+        block. Returns a tensor shaped like one expert row (``record.shape[1:]``)."""
+        rec = self._records[block_idx][slot_idx]
+        E = rec.shape[0]
+        per = rec.nbytes // E                      # bytes for one expert (dim-0 row)
+        start = rec.offset + expert_id * per        # file offset of this expert
+        # O_DIRECT needs offset+length+buffer all _ALIGN-aligned; read the covering aligned window.
+        win_start = (start // _ALIGN) * _ALIGN
+        win_end = ((start + per + _ALIGN - 1) // _ALIGN) * _ALIGN
+        win_len = win_end - win_start
+        buf = self._expert_buf(win_len)
+        got = os.preadv(self._rfd, [memoryview(buf.numpy())[:win_len]], win_start)
+        if got < (start - win_start) + per:  # pragma: no cover - short read is a store bug
+            raise IOError(f"short expert read: {got} < {(start-win_start)+per}")
+        if self.mode == "buffered+fadvise":
+            if _HAS_FADVISE:
+                os.posix_fadvise(self._rfd, win_start, win_len, os.POSIX_FADV_DONTNEED)
+        off = start - win_start
+        return buf[off : off + per].view(rec.dtype).view(rec.shape[1:])
+
+    def _expert_buf(self, nbytes: int) -> torch.Tensor:
+        b = getattr(self, "_ebuf", None)
+        if b is None or b.numel() < nbytes:
+            b = _aligned_pinned_u8(nbytes, pin=self.pin)
+            self._ebuf = b
+        return b
 
     def state_tensor(self, block_idx: int, slot_idx: int) -> torch.Tensor:
         # Rare path (full-model save): a fresh tensor, and its own buffer, so it never disturbs
