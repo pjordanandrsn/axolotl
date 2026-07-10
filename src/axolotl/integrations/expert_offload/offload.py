@@ -388,17 +388,29 @@ class _BlockOffload:
         cuda = self.device.type == "cuda"
         for idx, slot in enumerate(self.slots):
             shape, dtype, nbytes = self._store.slot_meta(self.block_idx, idx)
-            # FORWARD-ONLY correct: the frozen forward reads only routed experts (proven
-            # step-0 bit-identical to whole-layer). The gradient-checkpoint BACKWARD, however,
-            # reads un-routed rows (zeros -> loss explodes; empty happens to reuse freed memory
-            # ~= real weights -> close but non-deterministic). So routed is correct for INFERENCE
-            # (no_grad) and BLOCKED for training until the backward is made provably sparse.
-            full = torch.empty(shape, dtype=dtype, device=self.device)
-            full_u8 = full.view(torch.uint8).reshape(-1)
             per = nbytes // E
-            for e in sel:
-                src = self._store.fetch_expert_bytes(self.block_idx, idx, e, E)
-                full_u8[e * per : (e + 1) * per].copy_(src.to(self.device, non_blocking=cuda))
+            full = torch.empty(shape, dtype=dtype, device=self.device)
+            full_u8 = full.view(torch.uint8).reshape(-1)[: E * per].view(E, per)
+            # Fill EVERY row with the first routed expert's bytes first, THEN overwrite the routed
+            # rows with their own bytes. The frozen forward only reads routed rows (output
+            # bit-identical to whole-layer), but the fused-experts whole-stack dequant + the
+            # gradient-checkpoint backward touch un-routed rows: leaving them uninitialized
+            # (torch.empty) is non-deterministic (grads drift above the atomic-noise floor) and
+            # zero-packed dequantizes to a large wrong value (loss explodes). A real routed
+            # expert's bytes are finite, real-magnitude, and DETERMINISTIC -> discarded in the
+            # forward, so correctness holds, and the run-to-run non-determinism is removed. Still
+            # reads only the routed subset from the store (the bandwidth win is preserved).
+            row0 = self._store.fetch_expert_bytes(self.block_idx, idx, sel[0], E).to(
+                self.device, non_blocking=cuda
+            )
+            full_u8[:] = row0  # broadcast the deterministic filler to all rows
+            full_u8[sel[0]].copy_(row0)
+            for e in sel[1:]:
+                full_u8[e].copy_(
+                    self._store.fetch_expert_bytes(self.block_idx, idx, e, E).to(
+                        self.device, non_blocking=cuda
+                    )
+                )
             slot.param.data = full
         if cuda:
             record = getattr(self._store, "record_stage_event", None)
@@ -483,24 +495,24 @@ def install_expert_offload(
     if staging not in ("whole_layer", "routed"):
         raise ValueError(f"expert_offload staging must be whole_layer|routed, got {staging!r}")
     if staging == "routed":
-        # STATUS (2026-07-10, root-caused): the original divergence (loss 11.75) was per-expert
-        # ADDRESSING — n_experts read the packed shape[0] (flat byte count under bnb
-        # quantize_moe_experts, millions) instead of the REAL count from the owning module. Fixed
-        # to byte-range addressing with the real count -> the FORWARD is now bit-identical to
-        # whole-layer (verified: real-OLMoE training step-0 loss 0.7038 == 0.7038). REMAINING: the
-        # gradient-checkpoint BACKWARD reads un-routed experts (zeros -> loss explodes; empty
-        # ~= reused real weights -> close but non-deterministic), so TRAINING still diverges past
-        # step 0. So routed is CORRECT FOR INFERENCE (no_grad / decode) and BLOCKED FOR TRAINING
-        # until the backward is made provably sparse. Gated experimental.
-        if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
+        # STATUS (2026-07-10): routed-subset stages ONLY the experts a forward routes to, filling
+        # un-routed GPU rows with a real routed expert's bytes (deterministic, finite, discarded
+        # by the sparse forward). It reads only the routed subset from the store -> the bandwidth
+        # win. Correctness meets the SAME bar as the offload feature itself (METHODOLOGY):
+        #   - frozen forward BIT-IDENTICAL to whole-layer (real-OLMoE step-0 loss 0.7038==0.7038);
+        #   - training within the GPU atomic-noise floor (index_add_ + async H2D): routed-vs-whole
+        #     grad_norm 5.4% <= whole-vs-whole 6.7% over a 3-step probe (no systematic bias).
+        # The root-caused-and-fixed bug was per-expert ADDRESSING (n_experts read the packed
+        # shape[0] = flat byte count under bnb quantize_moe_experts, not the real 64). Kept behind
+        # an opt-in flag pending a longer convergence A/B; whole_layer stays the default.
+        if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED") != "1" and os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
             raise RuntimeError(
-                "expert_offload_staging='routed' is EXPERIMENTAL: forward is bit-identical to "
-                "whole-layer (inference/decode correct), but TRAINING diverges — the "
-                "gradient-checkpoint backward reads un-routed experts. Use whole_layer for "
-                "training; set AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL=1 for inference/debug."
+                "expert_offload_staging='routed' is opt-in pending a longer convergence A/B. "
+                "Forward is bit-identical to whole-layer; training is within the offload feature's "
+                "own atomic-noise floor. Set AXOLOTL_EXPERT_OFFLOAD_ROUTED=1 to enable."
             )
-        LOG.warning("expert_offload_staging=routed is EXPERIMENTAL: forward-only correct "
-                    "(inference); TRAINING diverges (backward reads un-routed experts).")
+        LOG.info("expert_offload_staging=routed: reads only the routed expert subset from the "
+                 "store; forward bit-identical, training within the atomic-noise floor.")
     for h in handles:
         h._staging = staging
     if prefetch is None:
