@@ -495,24 +495,28 @@ def install_expert_offload(
     if staging not in ("whole_layer", "routed"):
         raise ValueError(f"expert_offload staging must be whole_layer|routed, got {staging!r}")
     if staging == "routed":
-        # STATUS (2026-07-10): routed-subset stages ONLY the experts a forward routes to, filling
+        # STATUS (2026-07-11): routed-subset stages ONLY the experts a forward routes to, filling
         # un-routed GPU rows with a real routed expert's bytes (deterministic, finite, discarded
-        # by the sparse forward). It reads only the routed subset from the store -> the bandwidth
-        # win. Correctness meets the SAME bar as the offload feature itself (METHODOLOGY):
-        #   - frozen forward BIT-IDENTICAL to whole-layer (real-OLMoE step-0 loss 0.7038==0.7038);
-        #   - training within the GPU atomic-noise floor (index_add_ + async H2D): routed-vs-whole
-        #     grad_norm 5.4% <= whole-vs-whole 6.7% over a 3-step probe (no systematic bias).
-        # The root-caused-and-fixed bug was per-expert ADDRESSING (n_experts read the packed
-        # shape[0] = flat byte count under bnb quantize_moe_experts, not the real 64). Kept behind
-        # an opt-in flag pending a longer convergence A/B; whole_layer stays the default.
+        # by the sparse forward). Frozen FORWARD is bit-identical to whole-layer (real-OLMoE
+        # step-0 loss 0.7038==0.7038) -- the decode/inference use case is sound. TRAINING is NOT:
+        # the pre-registered convergence A/B at published-config scale (Qwen3-30B-A3B, seq 2048 +
+        # packing, 150 steps, bracket whole/routed/whole) FAILED -- routed final eval 1.572 vs
+        # whole 1.509/1.511, |whole-whole| floor 0.002, routed 31x outside it, train loss higher
+        # on 146/150 steps (systematic, one-sided). Short-horizon probes (15-step OLMoE, 3-step
+        # grad_norm) had looked clean; they did not transfer. There was also no wall-clock win at
+        # that scale (routed union ~124/128 experts at seq 2048, rf~0.97). Keep whole_layer for
+        # training; routed remains available for forward-only paths and for reproducing the A/B.
         if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED") != "1" and os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
             raise RuntimeError(
-                "expert_offload_staging='routed' is opt-in pending a longer convergence A/B. "
-                "Forward is bit-identical to whole-layer; training is within the offload feature's "
-                "own atomic-noise floor. Set AXOLOTL_EXPERT_OFFLOAD_ROUTED=1 to enable."
+                "expert_offload_staging='routed' FAILED its pre-registered training convergence "
+                "A/B at scale (Qwen3-30B, 150 steps: eval 1.572 vs whole 1.509/1.511, floor "
+                "0.002). Forward/decode is bit-identical to whole-layer; TRAINING with it "
+                "diverges systematically. Use whole_layer for training. Set "
+                "AXOLOTL_EXPERT_OFFLOAD_ROUTED=1 only for forward-only use or to reproduce the A/B."
             )
         LOG.info("expert_offload_staging=routed: reads only the routed expert subset from the "
-                 "store; forward bit-identical, training within the atomic-noise floor.")
+                 "store; forward bit-identical. WARNING: training convergence A/B FAILED at scale "
+                 "(Qwen3-30B/150 steps, 31x the whole-vs-whole floor) -- do not train with this.")
     for h in handles:
         h._staging = staging
     if prefetch is None:
