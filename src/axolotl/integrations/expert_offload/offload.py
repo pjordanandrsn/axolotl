@@ -296,6 +296,7 @@ class _BlockOffload:
         self.staged = False
         for idx, slot in enumerate(slots):
             self._install_state_dict_hook(slot, idx)
+        self._staged_sel = None  # routed-staged union; None = full/whole coverage
         self.evict()  # start evicted: experts hold placeholders, ~0 GPU footprint
 
     @property
@@ -340,6 +341,29 @@ class _BlockOffload:
         are filled from the store, so flash/H2D traffic is ``read_fraction`` x the layer. Un-routed
         rows are never indexed by the MoE forward, so the output is bit-identical to whole-layer."""
         if self.staged:
+            if self._staging != "routed" or self._staged_sel is None:
+                return  # whole-layer content is routing-independent -> plain idempotence
+            # ROUTED staleness (the 104x-floor acceptance-FAIL mechanism, 2026-07-11): backward
+            # walks blocks LAST->FIRST, so block 1 is the last thing staged in every backward and
+            # the FIRST thing the next microbatch's forward needs -- its pre-hook used to see
+            # ``staged`` and silently serve the PREVIOUS microbatch's expert union to NEW data.
+            # Tokens routed outside that stale union read a zero-masked (or, legacy, wrong-expert)
+            # row: coherent, fill-proportional corruption (never visible in eval, whose pass order
+            # never leaves the first-needed block staged). Fix: the guard is routing-AWARE -- serve
+            # the staged tensor only if this call's union is covered; otherwise TOP-UP just the
+            # missing experts into the live resident tensor and record them.
+            sel = self._routed_experts(args)
+            if sel is None or self._staged_sel.issuperset(sel):
+                return
+            missing = sorted(set(sel) - self._staged_sel)
+            if os.environ.get("DRIFT_LOG") == "1":
+                type(self)._drift_events = getattr(type(self), "_drift_events", 0) + 1
+                type(self)._drift_experts = getattr(type(self), "_drift_experts", 0) + len(missing)
+                if type(self)._drift_events <= 200:
+                    print(f"DRIFT block={self.name} +{len(missing)} experts "
+                          f"(staged {len(self._staged_sel)} -> {len(self._staged_sel)+len(missing)})", flush=True)
+            self._top_up_routed(missing)
+            self._staged_sel.update(missing)
             return
         cls = type(self)
         if cls._resident is not None and cls._resident is not self:
@@ -401,6 +425,25 @@ class _BlockOffload:
             return None
         return torch.unique(idx).tolist()
 
+    def _top_up_routed(self, missing) -> None:
+        """Fetch ``missing`` experts' byte ranges into the ALREADY-STAGED live tensors (no
+        realloc, no eviction). Called by the routing-aware guard when a new forward's union
+        escapes the staged one -- the incremental form of "stage the outside experts"."""
+        E = self._n_experts_real
+        if not E:
+            return
+        cuda = self.device.type == "cuda"
+        for idx, slot in enumerate(self.slots):
+            _, _, nbytes = self._store.slot_meta(self.block_idx, idx)
+            per = nbytes // E
+            live_u8 = slot.param.data.view(torch.uint8).reshape(-1)[: E * per].view(E, per)
+            for e in missing:
+                live_u8[e].copy_(
+                    self._store.fetch_expert_bytes(self.block_idx, idx, e, E).to(
+                        self.device, non_blocking=cuda
+                    )
+                )
+
     def _stage_routed(self, sel) -> None:
         """Allocate each slot's FULL packed GPU tensor, fill only the routed experts' byte
         ranges from the store, and MASK un-routed regions with the zero-decode byte (they
@@ -411,6 +454,7 @@ class _BlockOffload:
         E = self._n_experts_real
         if not E:  # can't identify the expert count -> safe fallback to whole-layer
             return self._stage_whole()
+        self._staged_sel = set(sel)  # the routing-aware guard tops up against this
         if os.environ.get("STAGED_COUNT_LOG") == "1" and not getattr(self, "_stagedcnt_logged", False):
             # one-shot per block: the measured-rf instrument used by the dose-response A/Bs
             self._stagedcnt_logged = True
@@ -478,6 +522,7 @@ class _BlockOffload:
         for slot in self.slots:
             slot.param.data = _placeholder(self.device, slot.param.data.dtype)
         self.staged = False
+        self._staged_sel = None
         cls = type(self)
         if cls._resident is self:
             cls._resident = None
