@@ -549,26 +549,38 @@ def install_expert_offload(
         #   seq  256, rf 0.688 (~31% fill): routed gap 0.186 = 186x the floor (0.001, 3 warm arms)
         # Fill x10 -> gap x3 (H_FILL confirmed; a fixed-per-step-corruption hypothesis, which
         # predicted a constant ~0.06 gap, is refuted). Horizon is NOT the driver -- the gap is
-        # established by step 50 and stable-to-declining. The un-routed rows are touched by the
-        # gradient-checkpointed backward's recompute dequant; the deterministic fill leaks
-        # fill-proportional error into the gradients. THE FIX: mask that recompute to the routed
-        # rows (make the backward genuinely sparse) so un-routed rows are never dequantized in
-        # backward. Note the damage is WORST at low rf -- exactly routed's target regime (decode /
-        # short sequences) -- so the fix is load-bearing, not optional. Keep whole_layer for
-        # training; routed is forward/decode-only until the backward is masked.
+        # established by step 50 and stable-to-declining.
+        #
+        # THE ZERO-DECODE MASK (default fill) was the pre-registered fix: un-routed rows dequantize
+        # to EXACTLY 0.0 (proven per-expert on real bnb). Its ACCEPTANCE RUN (2026-07-11, prereg
+        # 411b57f, same seq256 point, 3-warm-arm floor 0.001) says it is CORRECT BUT INSUFFICIENT:
+        #   routed_mask gap 0.104 = 104x floor (FAIL);  legacy control gap 0.182 = 182x (valid).
+        # The mask removes ~44% of the divergence (the fill-CONTENT component) and leaves a ~104x
+        # coherent residual. Two independent lines say the residual is a COHERENT/COMPOUNDING bias,
+        # not independent noise: (1) the A4 arm -- doubling gradient averaging ga4->ga8 barely moved
+        # the legacy gap (ratio 0.916, vs 0.71 predicted for quadrature noise); (2) the seq512
+        # dose-response is CONVEX. Leading hypothesis for the residual: routing DRIFT across the
+        # gradient-checkpoint recompute -- as the attention LoRA trains, the recomputed forward
+        # routes some tokens to experts OUTSIDE the originally-staged union, which then read a zeroed
+        # row instead of the correct expert (coherent, un-averageable, grows with fill). Content
+        # masking cannot fix that; a drift-robust superset stager (or recompute-time restaging) is
+        # the open path, and it converges toward whole_layer as drift grows. So: routed TRAINING is
+        # still non-viable -- whole_layer is the only training-validated staging. Forward/decode is
+        # bit-identical and unaffected.
         if os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED") != "1" and os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_EXPERIMENTAL") != "1":
             raise RuntimeError(
-                "expert_offload_staging='routed' is forward/decode-only: its TRAINING divergence "
-                "scales with un-routed fill mass (pre-registered dose-response: gap 0.062 at rf "
-                "0.97 -> 0.186 at rf 0.688, 186x the floor), and is WORST at the low rf routed "
-                "targets. Forward is bit-identical to whole-layer. Fix = mask the checkpointed "
-                "backward's recompute dequant to routed rows. Use whole_layer for training; set "
-                "AXOLOTL_EXPERT_OFFLOAD_ROUTED=1 only for forward-only use or to reproduce the A/B."
+                "expert_offload_staging='routed' is forward/decode-only for now. Its TRAINING "
+                "divergence scales with un-routed fill mass (dose-response 31x->186x floor as rf "
+                "0.97->0.69); the zero-decode mask (default) is CORRECT but only ~halves it "
+                "(acceptance run: 104x floor, still FAIL) -- a coherent residual (routing drift "
+                "across the checkpointed recompute) survives. Forward is bit-identical to "
+                "whole-layer. Use whole_layer for training; set AXOLOTL_EXPERT_OFFLOAD_ROUTED=1 "
+                "only for forward/decode use or to reproduce the A/Bs."
             )
-        LOG.info("expert_offload_staging=routed: reads only the routed expert subset from the "
-                 "store; forward bit-identical. WARNING: TRAINING diverges proportional to "
-                 "un-routed fill mass (dose-response: 186x the floor at rf 0.69) -- forward/decode "
-                 "only until the checkpointed backward is masked to routed rows.")
+        LOG.info("expert_offload_staging=routed: reads only the routed expert subset; forward "
+                 "bit-identical. WARNING: TRAINING still diverges -- the zero-decode mask halves "
+                 "the gap (104x floor, FAIL at acceptance) but a coherent routing-drift residual "
+                 "survives. Forward/decode only.")
     for h in handles:
         h._staging = staging
     if prefetch is None:
