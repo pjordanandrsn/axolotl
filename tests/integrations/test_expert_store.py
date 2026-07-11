@@ -15,7 +15,11 @@ import hashlib
 import pytest
 import torch
 
-from axolotl.integrations.expert_offload.offload import install_expert_offload
+from axolotl.integrations.expert_offload.offload import (
+    _Slot,
+    _zero_decode_byte,
+    install_expert_offload,
+)
 from axolotl.integrations.expert_offload.store import FileStore, RAMStore
 
 from .test_expert_offload import FakeGroupedMoEModel, FakeMoEModel
@@ -393,3 +397,61 @@ class TestRoutedSubsetStaging:
             model(x, use_ckpt=False)
         # something was read, and strictly fewer than every (expert x layer x slot) if routing is sparse
         assert 0 < len(read) <= 8
+
+
+class TestMaskFixZeroDecode:
+    """The mask fix: un-routed rows are filled with the byte that DEQUANTIZES to exactly 0.0, so
+    they contribute nothing to any read of the packed stack (forward or the checkpointed-backward
+    recompute) -- masked-dequant implemented at the packed level. These tests cover the byte
+    SELECTION (CPU) and the per-expert STAGING SEMANTICS on real bitsandbytes (CUDA). They do NOT
+    assert training-convergence efficacy: the CPU MoE fakes are sparse/routing-weighted and cannot
+    reproduce the whole-stack dequant that leaks un-routed content in the real model, so efficacy
+    is established by the real-model acceptance run, not here."""
+
+    def test_zero_decode_byte_float_slot_is_zero(self):
+        p = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+        assert _zero_decode_byte(_Slot(param=p, owner=torch.nn.Module(), keys=("weight",))) == 0x00
+
+    def test_zero_decode_byte_nf4_default(self):
+        # a uint8 packed slot with no discoverable quant_type defaults to nf4 -> 0x77 (code 7 = 0.0)
+        p = torch.nn.Parameter(torch.zeros(8, dtype=torch.uint8), requires_grad=False)
+        assert _zero_decode_byte(_Slot(param=p, owner=torch.nn.Module(), keys=("weight",))) == 0x77
+
+    def test_zero_decode_byte_fp4(self):
+        class _Owner(torch.nn.Module):
+            quant_type = "fp4"
+        p = torch.nn.Parameter(torch.zeros(8, dtype=torch.uint8), requires_grad=False)
+        assert _zero_decode_byte(_Slot(param=p, owner=_Owner(), keys=("weight",))) == 0x00
+
+    @pytest.mark.parametrize("quant_type,fill", [("nf4", 0x77), ("fp4", 0x00)])
+    def test_masked_dequant_is_exactly_zero_per_expert(self, quant_type, fill):
+        """The core correctness claim, on REAL bitsandbytes at the granularity the fix operates:
+        replicate _stage_routed's byte writes on a real quantize_4bit'd [E,out,in] stack (fill the
+        whole packed buffer with the zero-decode byte, overwrite the routed experts' byte ranges
+        with their real bytes), dequantize the WHOLE stack, and assert un-routed rows are EXACTLY
+        0.0 while routed rows equal the unmasked reference. Skips when CUDA/bnb are unavailable."""
+        cuda = torch.cuda.is_available()
+        if not cuda:
+            pytest.skip("real-bnb 4-bit quantize requires CUDA")
+        try:
+            from bitsandbytes.functional import quantize_4bit, dequantize_4bit
+        except Exception as e:  # pragma: no cover
+            pytest.skip(f"bitsandbytes unavailable: {e}")
+        E, OUT, IN, K = 8, 64, 32, 3
+        torch.manual_seed(0)
+        W = torch.randn(E, OUT, IN, device="cuda") * 0.08
+        packed, qs = quantize_4bit(W.reshape(-1), quant_type=quant_type)
+        ref = dequantize_4bit(packed, qs, quant_type=quant_type).reshape(E, OUT, IN)
+        per = packed.numel() // E
+        sel = sorted(torch.randperm(E)[:K].tolist())
+        masked = packed.clone().view(torch.uint8)
+        masked.fill_(fill)
+        src = packed.view(torch.uint8)
+        for e in sel:
+            masked[e * per:(e + 1) * per] = src[e * per:(e + 1) * per]
+        deq = dequantize_4bit(masked.view(packed.dtype), qs, quant_type=quant_type).reshape(E, OUT, IN)
+        for e in range(E):
+            if e in sel:
+                assert torch.equal(deq[e], ref[e]), f"routed expert {e} changed"
+            else:
+                assert deq[e].abs().max().item() == 0.0, f"un-routed expert {e} not exactly zero"

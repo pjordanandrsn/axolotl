@@ -126,6 +126,32 @@ def _is_pinned(t: torch.Tensor) -> bool:
         return False
 
 
+def _zero_decode_byte(slot: _Slot) -> int:
+    """The fill byte whose decoded value is EXACTLY 0.0 for this slot's storage.
+
+    4-bit packed (uint8) slots: both nibbles must hold the codebook index of 0.0 —
+    nf4 index 7 (byte 0x77), fp4 index 0 (byte 0x00). Unpacked float slots: byte 0x00
+    IS 0.0. Quant type is read from the owner's Bnb4bitParametrization when present
+    (the ``quantize_moe_experts`` layout) or a ``quant_type``-ish attribute (kit
+    layouts); defaults to nf4."""
+    if slot.param.dtype != torch.uint8:
+        return 0x00  # float/bf16 passthrough: zero bytes == 0.0
+    qt = None
+    plists = getattr(slot.owner, "parametrizations", None)
+    if isinstance(plists, nn.ModuleDict):
+        for plist in plists.values():
+            for par in plist:
+                if type(par).__name__ == "Bnb4bitParametrization":
+                    qs = getattr(par, "quant_state", None)
+                    qt = getattr(qs, "quant_type", None)
+                    break
+            if qt:
+                break
+    if qt is None:
+        qt = getattr(slot.owner, "quant_type", None)
+    return 0x00 if str(qt).lower() == "fp4" else 0x77  # nf4 (default): code 7 = 0.0
+
+
 def _is_linear4bit(module: nn.Module) -> bool:
     """A ``bitsandbytes`` ``Linear4bit`` whose ``weight`` is a packed 4-bit ``Params4bit``.
 
@@ -376,36 +402,54 @@ class _BlockOffload:
         return torch.unique(idx).tolist()
 
     def _stage_routed(self, sel) -> None:
-        """Allocate each slot's FULL packed GPU tensor and fill only the routed experts' byte
-        ranges from the store; un-routed regions stay uninitialized (never indexed by the MoE
-        forward) -> bit-identical output. Experts are the leading contiguous byte dimension, so
+        """Allocate each slot's FULL packed GPU tensor, fill only the routed experts' byte
+        ranges from the store, and MASK un-routed regions with the zero-decode byte (they
+        dequantize to exact 0.0 rows) -> bit-identical output AND an inert backward. Experts are the leading contiguous byte dimension, so
         expert ``e`` occupies ``[e*per : (e+1)*per]`` of the flat packed bytes — correct for both
         the flat bnb layout and the ``[num_experts, ...]`` kit layout, using the REAL expert count
         (``self._n_experts_real``), never ``shape[0]``."""
         E = self._n_experts_real
         if not E:  # can't identify the expert count -> safe fallback to whole-layer
             return self._stage_whole()
+        if os.environ.get("STAGED_COUNT_LOG") == "1" and not getattr(self, "_stagedcnt_logged", False):
+            # one-shot per block: the measured-rf instrument used by the dose-response A/Bs
+            self._stagedcnt_logged = True
+            print(f"STAGEDCNT block={self.name} staged={len(sel)}/{E} rf={len(sel)/E:.3f}", flush=True)
         cuda = self.device.type == "cuda"
+        legacy_fill = os.environ.get("AXOLOTL_EXPERT_OFFLOAD_ROUTED_FILL") == "real"
         for idx, slot in enumerate(self.slots):
             shape, dtype, nbytes = self._store.slot_meta(self.block_idx, idx)
             per = nbytes // E
             full = torch.empty(shape, dtype=dtype, device=self.device)
-            full_u8 = full.view(torch.uint8).reshape(-1)[: E * per].view(E, per)
-            # Fill EVERY row with the first routed expert's bytes first, THEN overwrite the routed
-            # rows with their own bytes. The frozen forward only reads routed rows (output
-            # bit-identical to whole-layer), but the fused-experts whole-stack dequant + the
-            # gradient-checkpoint backward touch un-routed rows: leaving them uninitialized
-            # (torch.empty) is non-deterministic (grads drift above the atomic-noise floor) and
-            # zero-packed dequantizes to a large wrong value (loss explodes). A real routed
-            # expert's bytes are finite, real-magnitude, and DETERMINISTIC -> discarded in the
-            # forward, so correctness holds, and the run-to-run non-determinism is removed. Still
-            # reads only the routed subset from the store (the bandwidth win is preserved).
-            row0 = self._store.fetch_expert_bytes(self.block_idx, idx, sel[0], E).to(
-                self.device, non_blocking=cuda
-            )
-            full_u8[:] = row0  # broadcast the deterministic filler to all rows
-            full_u8[sel[0]].copy_(row0)
-            for e in sel[1:]:
+            flat_u8 = full.view(torch.uint8).reshape(-1)
+            full_u8 = flat_u8[: E * per].view(E, per)
+            if legacy_fill:
+                # LEGACY (pre-mask-fix) fill, kept ONLY for reproducing the dose-response A/Bs and
+                # the A4 attenuation arm: broadcast a real routed expert's bytes into un-routed
+                # rows. The 2026-07-11 dose-response showed this leaks fill-proportional error
+                # into training (gap 0.062/0.084/0.186 at fill 0.03/0.19/0.31, convex).
+                row0 = self._store.fetch_expert_bytes(self.block_idx, idx, sel[0], E).to(
+                    self.device, non_blocking=cuda
+                )
+                full_u8[:] = row0
+                full_u8[sel[0]].copy_(row0)
+                rest = sel[1:]
+            else:
+                # MASK FIX (2026-07-11, the pre-registered fix): fill un-routed regions with the
+                # byte whose two 4-bit codes DECODE TO EXACTLY 0.0, so the whole-stack dequant
+                # (forward AND the gradient-checkpoint recompute in backward) yields true zero
+                # rows for every un-routed expert under ANY absmax — masked-dequant semantics
+                # implemented at the packed level. Zero rows are inert in any linear read: the
+                # sparse forward never indexes them, and whatever residual path touched un-routed
+                # content (the dose-response mechanism) now reads exact zeros instead of a real
+                # expert's weights. NB packed zero BYTES are NOT zero weights (nf4 code 0 decodes
+                # to -1.0 -> the historical zeros-explosion); the zero-decode byte is quant-type
+                # specific: nf4 code 7 = 0.0 -> 0x77; fp4 code 0 = 0.0 -> 0x00. Float (unpacked)
+                # slots zero at byte 0x00. Also cheaper than the legacy fill: one memset, no
+                # extra store fetch.
+                flat_u8.fill_(_zero_decode_byte(slot))
+                rest = sel
+            for e in rest:
                 full_u8[e].copy_(
                     self._store.fetch_expert_bytes(self.block_idx, idx, e, E).to(
                         self.device, non_blocking=cuda
