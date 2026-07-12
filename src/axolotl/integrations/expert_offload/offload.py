@@ -59,7 +59,9 @@ stage/evict swaps; the config schema refuses to enable under any of them.
 
 from __future__ import annotations
 
+import json
 import os
+import time
 
 from typing import NamedTuple
 
@@ -103,6 +105,88 @@ def _placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         ph = torch.empty(0, dtype=dtype, device=device)
         _PLACEHOLDERS[key] = ph
     return ph
+
+
+class _H2DProbe:
+    """Stage-copy decomposition for the seq-residue investigation (``E4B_H2D_PROBE=1``).
+
+    The exposed R−V residue grows 21→102 ms with sequence length and is NOT
+    lookahead-hideable (RESULTS-baremetal2 R1/R2), leaving two live mechanisms:
+    the copy path itself degrading at long seq (H-B — shows as per-byte DEVICE
+    duration growth) vs host-side allocator/serialization stalls in the nominally
+    async submit (H-C — shows as host wall-time growth of the ``.to()`` loop).
+    Per CUDA stage: host submit wall time, a bracketing CUDA event pair for the
+    copy group's device duration, bytes, and a periodic allocator snapshot.
+    Event pairs are harvested LAZILY on the same handle's next probed stage via
+    ``query()`` — never ``synchronize()`` — so the probe cannot add sync points
+    to the pipeline it measures; unfinished pairs are counted as drops. JSONL to
+    ``E4B_H2D_PROBE_OUT`` (default ``h2d_probe.jsonl``) at process exit."""
+
+    _MEM_KEYS = (
+        "num_alloc_retries",
+        "num_device_alloc",
+        "num_device_free",
+        "reserved_bytes.all.current",
+        "allocated_bytes.all.peak",
+    )
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+        self.pending: dict[int, tuple] = {}
+        self.drops = 0
+        self._n = 0
+        import atexit
+
+        atexit.register(self.dump)
+
+    def harvest(self, key: int) -> None:
+        p = self.pending.pop(key, None)
+        if p is None:
+            return
+        ev0, ev1, submit_s, block_idx, nbytes, t_wall = p
+        if not ev1.query():
+            self.drops += 1
+            return
+        rec = {
+            "t": round(t_wall, 6),
+            "b": block_idx,
+            "submit_ms": round(submit_s * 1e3, 4),
+            "dev_ms": round(ev0.elapsed_time(ev1), 4),
+            "mb": round(nbytes / 1e6, 2),
+        }
+        self._n += 1
+        if self._n % 64 == 1:
+            stats = torch.cuda.memory_stats()
+            rec["mem"] = {k: stats.get(k) for k in self._MEM_KEYS}
+        self.records.append(rec)
+
+    def start(self) -> tuple:
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev0.record()
+        return ev0, time.monotonic()
+
+    def finish(self, key: int, started: tuple, block_idx: int, nbytes: int) -> None:
+        ev0, t0 = started
+        submit_s = time.monotonic() - t0
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev1.record()
+        self.pending[key] = (ev0, ev1, submit_s, block_idx, nbytes, time.monotonic())
+
+    def dump(self) -> None:  # pragma: no cover - exit-path diagnostics
+        path = os.environ.get("E4B_H2D_PROBE_OUT", "h2d_probe.jsonl")
+        try:
+            with open(path, "w") as f:
+                for r in self.records:
+                    f.write(json.dumps(r) + "\n")
+            print(
+                f"E4B_H2D_PROBE: {len(self.records)} records ({self.drops} drops) -> {path}",
+                flush=True,
+            )
+        except OSError as e:
+            print(f"E4B_H2D_PROBE: dump failed: {e}", flush=True)
+
+
+_H2D_PROBE = _H2DProbe() if os.environ.get("E4B_H2D_PROBE") == "1" else None
 
 
 def _copy_required_for(provider, block_idx: int) -> bool:
@@ -357,6 +441,10 @@ class _BlockOffload:
         # Whoever owns the source buffers also owns the guard that protects them.
         provider = self._prefetch if prefetched is not None else self._store
         cuda = self.device.type == "cuda"
+        probe = _H2D_PROBE if cuda else None
+        if probe is not None:
+            probe.harvest(id(self))
+            probe_start = probe.start()
         for idx, slot in enumerate(self.slots):
             src = (
                 prefetched[idx]
@@ -375,6 +463,8 @@ class _BlockOffload:
             else:
                 slot.param.data = src.to(self.device, non_blocking=True)
         if cuda:
+            if probe is not None:
+                probe.finish(id(self), probe_start, self.block_idx, self.bytes)
             # Guard the buffers the copies above are reading; the owner waits on this event
             # before refilling them. RAMStore's hook is a no-op (its homes are persistent).
             record = getattr(provider, "record_stage_event", None)
