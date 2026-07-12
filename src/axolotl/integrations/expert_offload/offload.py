@@ -664,6 +664,7 @@ def install_expert_offload(
         f"expert_offload{rank}: homed {n_experts} expert layers across {len(handles)} MoE blocks "
         f"({total_gb:.2f} GB) to {where}; one block resident on {device} at a time."
     )
+    model._expert_offload_handles = handles  # external harness (activation-diff) flips staging per pass
     return handles
 
 
