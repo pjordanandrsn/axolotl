@@ -455,6 +455,12 @@ class _BlockOffload:
         if not E:  # can't identify the expert count -> safe fallback to whole-layer
             return self._stage_whole()
         self._staged_sel = set(sel)  # the routing-aware guard tops up against this
+        if os.environ.get("ROUTED_PAD") == "full":
+            # BISECTION CONTROL: stage ALL E experts (same bytes as whole-layer) while keeping the
+            # routed ASSEMBLY path (torch.empty + per-expert copy loop). Isolates "is the residual
+            # from the subset itself" (R128 lands at the floor) vs "from the assembly mechanics"
+            # (R128 diverges like routed). No zero rows, no top-up (full set covers every union).
+            sel = list(range(E))
         if os.environ.get("STAGED_COUNT_LOG") == "1" and not getattr(self, "_stagedcnt_logged", False):
             # one-shot per block: the measured-rf instrument used by the dose-response A/Bs
             self._stagedcnt_logged = True

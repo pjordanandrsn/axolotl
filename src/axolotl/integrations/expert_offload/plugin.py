@@ -28,13 +28,54 @@ class ExpertOffloadPlugin(BasePlugin):
         return "axolotl.integrations.expert_offload.ExpertOffloadArgs"
 
 
+    def _make_act_dump(self, model):
+        """ACT_DUMP=1: register forward hooks on every MoE experts module; on the FIRST forward
+        (step 0) record each block's output activation SIGNED MEAN + mean-abs + numel at float64,
+        to ACT_DUMP_PATH. Comparing signed means across arms (whole vs routed vs R128) detects a
+        COHERENT per-value bias at resolution ~ noise/sqrt(numel) (~500k/block) — far below a
+        max-abs diff. One-shot; removes its own hooks after step 0."""
+        import os, json, torch
+        from transformers import TrainerCallback
+
+        path = os.environ.get("ACT_DUMP_PATH", "/tmp/act_dump.jsonl")
+        state = {"hooks": [], "done": False}
+
+        def hook(mod, inp, out, name):
+            if state["done"]:
+                return
+            o = out[0] if isinstance(out, tuple) else out
+            if not isinstance(o, torch.Tensor):
+                return
+            od = o.detach().double()
+            rec = {"block": name, "signed_mean": float(od.mean().item()),
+                   "abs_mean": float(od.abs().mean().item()), "numel": int(od.numel())}
+            with open(path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+
+        class _ActDump(TrainerCallback):
+            def on_train_begin(self, args, state_, control, **kw):
+                for n, m in model.named_modules():
+                    if n.endswith("mlp.experts"):
+                        state["hooks"].append(m.register_forward_hook(
+                            lambda mod, i, o, nm=n: hook(mod, i, o, nm)))
+            def on_step_end(self, args, state_, control, **kw):
+                if not state["done"]:
+                    for h in state["hooks"]:
+                        h.remove()
+                    state["done"] = True
+
+        return _ActDump()
+
     def add_callbacks_pre_trainer(self, cfg, model):
         """DIAGNOSTIC (env-gated GRAD_DUMP=1): dump per-trainable-param grad norms at float64
         each step to GRAD_DUMP_PATH, to localize where a routed-vs-whole training signal first
         diverges. Off by default; zero cost unless GRAD_DUMP=1."""
         import os
+        cbs = []
+        if os.environ.get("ACT_DUMP") == "1":
+            cbs.append(self._make_act_dump(model))
         if os.environ.get("GRAD_DUMP") != "1":
-            return []
+            return cbs
         import json, torch
         from transformers import TrainerCallback
 
@@ -54,7 +95,7 @@ class ExpertOffloadPlugin(BasePlugin):
                 with open(path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
 
-        return [_GradDump()]
+        return cbs + [_GradDump()]
 
     def post_model_load(self, cfg, model):
         """Install the offload after the model is built, quantized, PEFT-wrapped and on the GPU."""
